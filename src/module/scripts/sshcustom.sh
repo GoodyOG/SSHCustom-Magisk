@@ -19,12 +19,11 @@ mkdir -p "$RUN_DIR"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$CONTROL_LOG"; }
 
 set_desc() {
-  [ -f "$MODULE_PROP" ] || return 0
-  case "$1" in
-    running) sed -i 's/^description=.*/description=[ 🟢 ] SSHCustom-Magisk - running/' "$MODULE_PROP" 2>/dev/null ;;
-    paused) sed -i 's/^description=.*/description=[ 🟡 ] SSHCustom-Magisk - paused, waiting for network/' "$MODULE_PROP" 2>/dev/null ;;
-    *) sed -i 's/^description=.*/description=[ 🔴 ] SSHCustom-Magisk - stopped/' "$MODULE_PROP" 2>/dev/null ;;
-  esac
+  # module.prop description is now managed exclusively by the Go daemon's
+  # updateModuleProp() to avoid race conditions between sed and os.WriteFile
+  # that previously caused name/description to disappear. This function is
+  # kept as a no-op so call sites don't need updating.
+  :
 }
 
 pid_alive() { PID="$1"; [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; }

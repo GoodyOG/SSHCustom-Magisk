@@ -998,6 +998,10 @@
 
     function renderNetworkConfig(cfg) {
       if (!cfg) return;
+      // Do not overwrite settings controls while user is on the settings page
+      // and may have unsaved changes. SSE fires every few seconds and would
+      // snap the dropdown back before they hit "Apply & Restart".
+      if (currentPage === 'settings') return;
       const dns = cfg.dns || {};
       $('dnsMode').value = dns.mode || 'device';
       $('customDnsRow').hidden = $('dnsMode').value !== 'custom';

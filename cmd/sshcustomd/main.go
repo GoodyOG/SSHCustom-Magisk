@@ -1041,26 +1041,38 @@ func run(args []string) {
 	// The daemon stays alive always; tunnel start/stop/restart is controlled
 	// via the API or autostart. module.prop is updated to reflect tunnel state.
 	modulePropPath := "/data/adb/modules/sshcustom/module.prop"
+	const moduleDescription = "SSH-tunnel routing for rooted Android. SOCKS5 + transparent IPv4 TCP, hotspot share, payload injection, smart DNS resolver. Dashboard at http://127.0.0.1:9190"
 	updateModuleProp := func(status string) {
-		var desc string
+		var prefix string
 		switch status {
 		case "running":
-			desc = "description=[ \U0001F7E2 ] SSHCustom-Magisk - running"
+			prefix = "[ \U0001F7E2 Running ]"
 		case "standby":
-			desc = "description=[ \U0001F7E1 ] SSHCustom-Magisk - standby"
+			prefix = "[ \U0001F7E1 Standby ]"
 		default:
-			desc = "description=[ \U0001F534 ] SSHCustom-Magisk - disconnected"
+			prefix = "[ \U0001F534 Stopped ]"
 		}
+		desc := "description=" + prefix + " " + moduleDescription
 		data, err := os.ReadFile(modulePropPath)
 		if err != nil {
 			return
 		}
 		lines := strings.Split(string(data), "\n")
+		foundName := false
+		foundDesc := false
 		for i, line := range lines {
+			if strings.HasPrefix(line, "name=") {
+				foundName = true
+			}
 			if strings.HasPrefix(line, "description=") {
 				lines[i] = desc
+				foundDesc = true
 				break
 			}
+		}
+		// Safety: if name= line is missing, don't write back a broken file
+		if !foundName || !foundDesc {
+			return
 		}
 		_ = os.WriteFile(modulePropPath, []byte(strings.Join(lines, "\n")), 0644)
 	}

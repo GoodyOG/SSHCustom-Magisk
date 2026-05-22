@@ -34,8 +34,13 @@ cp -af "$MODPATH/scripts/sshcustom.sh" "$WORK_DIR/sshcustom.sh"
 cp -af "$MODPATH/scripts/sshcustom_watchdog.sh" "$WORK_DIR/sshcustom_watchdog.sh"
 cp -af "$MODPATH/scripts/net_clean.sh" "$WORK_DIR/net_clean.sh"
 
-# Always refresh module runtime config so new performance/network keys are applied.
-cp -af "$MODPATH/config/config.json" "$WORK_DIR/config.json"
+# Preserve user config on update. First install gets the bundled default.
+# On subsequent updates, user-modified settings (DNS mode, hotspot, etc.) are
+# kept intact. New keys from future versions will be populated by the daemon's
+# normalizeConfig() on first run.
+if [ ! -f "$WORK_DIR/config.json" ]; then
+  cp -af "$MODPATH/config/config.json" "$WORK_DIR/config.json"
+fi
 
 # Preserve user profiles on update. First install gets a safe editable sample.
 if [ ! -f "$WORK_DIR/profiles.json" ]; then
