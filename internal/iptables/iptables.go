@@ -44,6 +44,7 @@ type Config struct {
 	APIPort       int
 	SocksPort     int
 	DNSPort       int
+	DNSHijack     bool
 	Hotspot       bool
 	HotspotDNS    bool
 	HotspotIfaces []string
@@ -265,7 +266,7 @@ func Apply(cfg Config, bypassIPs []string) error {
 	must(run6("-t", "mangle", "-I", "OUTPUT", "1", "-j", v6block))
 
 	// Step 10: DNS redirect - intercept port 53 and redirect to local DNS forwarder
-	if cfg.DNSPort > 0 {
+	if cfg.DNSHijack && cfg.DNSPort > 0 {
 		dnsChain := prefix + "_DNS"
 		dnsPortStr := strconv.Itoa(cfg.DNSPort)
 		// Clean any leftover DNS chain first
@@ -389,10 +390,14 @@ func Cleanup(cfg Config) error {
 	runIgnore("-t", "nat", "-F", dnsChain)
 	runIgnore("-t", "nat", "-X", dnsChain)
 	// Remove hotspot DNS PREROUTING rules (all possible ports)
+	dnsPortStr := "10811"
+	if cfg.DNSPort > 0 {
+		dnsPortStr = strconv.Itoa(cfg.DNSPort)
+	}
 	for _, iface := range ifaces {
 		if strings.TrimSpace(iface) != "" {
-			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", "10811")
-			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", "10811")
+			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr)
+			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr)
 		}
 	}
 

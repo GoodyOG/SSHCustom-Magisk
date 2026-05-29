@@ -2962,6 +2962,7 @@ func iptablesCfgFromConfig(cfg Config) iptables.Config {
 		APIPort:       cfg.API.Port,
 		SocksPort:     cfg.LocalProxy.SocksPort,
 		DNSPort:       cfg.TransparentProxy.DNSPort,
+		DNSHijack:     cfg.DNS.Hijack,
 		Hotspot:       cfg.Hotspot.Enabled && cfg.Hotspot.TCP,
 		HotspotDNS:    cfg.Hotspot.Enabled && cfg.Hotspot.DNS,
 		HotspotIfaces: cfg.Hotspot.Interfaces,
@@ -3012,8 +3013,6 @@ func saveConfig(path string, cfg Config) error {
 func normalizeConfig(cfg *Config) {
 	mode := normalizeDNSMode(cfg.DNS.Mode)
 	cfg.DNS.Mode = mode
-	cfg.DNS.Hijack = false
-	cfg.DNS.DoH = false
 	switch mode {
 	case "google":
 		cfg.DNS.Enabled = true
