@@ -214,8 +214,12 @@ func AndroidCarrierDNS(ctx context.Context) []string {
 		"net.rmnet_data0.dns1", "net.rmnet_data0.dns2",
 		"net.rmnet_data1.dns1", "net.rmnet_data1.dns2",
 		"net.rmnet_data2.dns1", "net.rmnet_data2.dns2",
+		"net.rmnet_data3.dns1", "net.rmnet_data3.dns2",
+		"net.rmnet_data4.dns1", "net.rmnet_data4.dns2",
+		"net.rmnet_data5.dns1", "net.rmnet_data5.dns2",
 		"dhcp.rmnet_data0.dns1", "dhcp.rmnet_data0.dns2",
 		"dhcp.wlan0.dns1", "dhcp.wlan0.dns2",
+		"persist.net.dns1", "persist.net.dns2",
 	}
 	var servers []string
 	seen := map[string]bool{}

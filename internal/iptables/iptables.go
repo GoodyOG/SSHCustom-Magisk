@@ -43,7 +43,9 @@ type Config struct {
 	TCPPort       int
 	APIPort       int
 	SocksPort     int
+	DNSPort       int
 	Hotspot       bool
+	HotspotDNS    bool
 	HotspotIfaces []string
 }
 
@@ -97,6 +99,32 @@ func run(args ...string) error {
 func runIgnore(args ...string) {
 	fullArgs := append([]string{"-w", "5"}, args...)
 	_ = exec.Command("iptables", fullArgs...).Run()
+}
+
+// run6 executes an ip6tables command with -w 5 (wait for lock) and retry logic.
+func run6(args ...string) error {
+	fullArgs := append([]string{"-w", "5"}, args...)
+	var lastErr error
+	var lastOut []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		b, err := exec.Command("ip6tables", fullArgs...).CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		lastOut = b
+		if !strings.Contains(string(b), "xtables.lock") {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	return fmt.Errorf("ip6tables %s: %v %s", strings.Join(args, " "), lastErr, strings.TrimSpace(string(lastOut)))
+}
+
+// run6Ignore executes an ip6tables command, ignoring errors (for cleanup).
+func run6Ignore(args ...string) {
+	fullArgs := append([]string{"-w", "5"}, args...)
+	_ = exec.Command("ip6tables", fullArgs...).Run()
 }
 
 // ipCmd executes an ip command.
@@ -222,6 +250,48 @@ func Apply(cfg Config, bypassIPs []string) error {
 		runIgnore("-I", "FORWARD", "-j", "ACCEPT")
 	}
 
+	// Step 9: IPv6 blocking - force apps to use IPv4 (Happy Eyeballs fallback)
+	v6block := prefix + "_V6BLOCK"
+	run6Ignore("-t", "mangle", "-D", "OUTPUT", "-j", v6block)
+	run6Ignore("-t", "mangle", "-F", v6block)
+	run6Ignore("-t", "mangle", "-X", v6block)
+	must(run6("-t", "mangle", "-N", v6block))
+	must(run6("-t", "mangle", "-A", v6block, "-o", "lo", "-j", "RETURN"))
+	must(run6("-t", "mangle", "-A", v6block, "-d", "::1/128", "-j", "RETURN"))
+	must(run6("-t", "mangle", "-A", v6block, "-d", "fe80::/10", "-j", "RETURN"))
+	must(run6("-t", "mangle", "-A", v6block, "-m", "owner", "--uid-owner", "0", "-j", "RETURN"))
+	must(run6("-t", "mangle", "-A", v6block, "-p", "tcp", "-j", "DROP"))
+	must(run6("-t", "mangle", "-A", v6block, "-p", "udp", "-j", "DROP"))
+	must(run6("-t", "mangle", "-I", "OUTPUT", "1", "-j", v6block))
+
+	// Step 10: DNS redirect - intercept port 53 and redirect to local DNS forwarder
+	if cfg.DNSPort > 0 {
+		dnsChain := prefix + "_DNS"
+		dnsPortStr := strconv.Itoa(cfg.DNSPort)
+		// Clean any leftover DNS chain first
+		runIgnore("-t", "nat", "-D", "OUTPUT", "-j", dnsChain)
+		runIgnore("-t", "nat", "-F", dnsChain)
+		runIgnore("-t", "nat", "-X", dnsChain)
+		must(run("-t", "nat", "-N", dnsChain))
+		must(run("-t", "nat", "-A", dnsChain, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr))
+		must(run("-t", "nat", "-A", dnsChain, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr))
+		must(run("-t", "nat", "-I", "OUTPUT", "1", "-j", dnsChain))
+
+		// Hotspot DNS sharing
+		if cfg.HotspotDNS {
+			ifaces := cfg.HotspotIfaces
+			if len(ifaces) == 0 {
+				ifaces = DefaultHotspotIfaces
+			}
+			for _, iface := range ifaces {
+				if strings.TrimSpace(iface) != "" {
+					must(run("-t", "nat", "-I", "PREROUTING", "1", "-i", iface, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr))
+					must(run("-t", "nat", "-I", "PREROUTING", "1", "-i", iface, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", dnsPortStr))
+				}
+			}
+		}
+	}
+
 	// Filter fatal errors
 	var fatal []string
 	for _, e := range errs {
@@ -304,6 +374,25 @@ func Cleanup(cfg Config) error {
 		if strings.TrimSpace(iface) != "" {
 			runIgnore("-D", "FORWARD", "-i", iface, "-j", "ACCEPT")
 			runIgnore("-D", "FORWARD", "-o", iface, "-j", "ACCEPT")
+		}
+	}
+
+	// Phase 6: Remove IPv6 V6BLOCK chain
+	v6block := prefix + "_V6BLOCK"
+	run6Ignore("-t", "mangle", "-D", "OUTPUT", "-j", v6block)
+	run6Ignore("-t", "mangle", "-F", v6block)
+	run6Ignore("-t", "mangle", "-X", v6block)
+
+	// Phase 7: Remove DNS nat chain and hotspot PREROUTING rules
+	dnsChain := prefix + "_DNS"
+	runIgnore("-t", "nat", "-D", "OUTPUT", "-j", dnsChain)
+	runIgnore("-t", "nat", "-F", dnsChain)
+	runIgnore("-t", "nat", "-X", dnsChain)
+	// Remove hotspot DNS PREROUTING rules (all possible ports)
+	for _, iface := range ifaces {
+		if strings.TrimSpace(iface) != "" {
+			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", "10811")
+			runIgnore("-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", "10811")
 		}
 	}
 

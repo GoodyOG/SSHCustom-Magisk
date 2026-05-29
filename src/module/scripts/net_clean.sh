@@ -20,7 +20,7 @@ IP6T="ip6tables"
 # Every chain SSHCustom-Magisk has ever installed in any version. Keeping
 # legacy names here means a user upgrading from a pre-v2 build still gets
 # their orphaned chains removed even if those chains are no longer created.
-CHAINS="SSHC_OUTPUT SSHC_PREROUTING SSHC_PROXY SSHC_DNS SSHC_HOTSPOT SSHC_HOTSPOT_DNS"
+CHAINS="SSHC_OUTPUT SSHC_PREROUTING SSHC_PROXY SSHC_DNS SSHC_HOTSPOT SSHC_HOTSPOT_DNS SSHC_V6BLOCK"
 IFACES="wlan+ swlan+ ap+ rndis+ ncm+ bt-pan+"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
@@ -61,8 +61,31 @@ clean_v6() {
   done
 }
 
+# Clean IPv6 blocking rules (mangle table)
+clean_v6_mangle() {
+  V6BLOCK="${PREFIX:-SSHC}_V6BLOCK"
+  run $IP6T -t mangle -D OUTPUT -j "$V6BLOCK"
+  run $IP6T -t mangle -F "$V6BLOCK"
+  run $IP6T -t mangle -X "$V6BLOCK"
+}
+
+# Clean DNS redirect rules (nat table)
+clean_dns_nat() {
+  DNS_CHAIN="${PREFIX:-SSHC}_DNS"
+  run $IPT -t nat -D OUTPUT -j "$DNS_CHAIN"
+  run $IPT -t nat -F "$DNS_CHAIN"
+  run $IPT -t nat -X "$DNS_CHAIN"
+  # Hotspot DNS PREROUTING
+  for IF in $IFACES; do
+    run $IPT -t nat -D PREROUTING -i "$IF" -p udp --dport 53 -j REDIRECT --to-port 10811
+    run $IPT -t nat -D PREROUTING -i "$IF" -p tcp --dport 53 -j REDIRECT --to-port 10811
+  done
+}
+
 log "clean start"
 clean_v4
 clean_v6
+clean_v6_mangle
+clean_dns_nat
 log "clean complete"
 exit 0

@@ -1,0 +1,35 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Add IPv6 blocking and DNS redirect rules to iptables package, expand DNS property list in dnsx, and add net_clean.sh support for new chains",
+  "status": "in_progress",
+  "steps": [
+    "In internal/iptables/iptables.go: Add DNSPort int and HotspotDNS bool fields to the Config struct",
+    "In internal/iptables/iptables.go: Add run6() helper function that calls ip6tables with -w 5 and retry logic (same pattern as run() but uses ip6tables binary)",
+    "In internal/iptables/iptables.go: Add run6Ignore() helper function (same pattern as runIgnore() but uses ip6tables binary)",
+    "In internal/iptables/iptables.go Apply() function: AFTER all existing IPv4 TPROXY rules (after Step 8 hotspot section), add IPv6 blocking rules using a new chain prefix+'_V6BLOCK'. Create chain, add RETURN rules for loopback/::1/fe80::/uid-0, add DROP for tcp and udp, hook into OUTPUT with -I OUTPUT 1",
+    "In internal/iptables/iptables.go Apply() function: Add DNS redirect nat rules if cfg.DNSPort > 0. Create chain prefix+'_DNS', add REDIRECT rules for udp/tcp port 53 to cfg.DNSPort, hook into nat OUTPUT with -I OUTPUT 1",
+    "In internal/iptables/iptables.go Apply() function: If cfg.HotspotDNS is true and cfg.DNSPort > 0, add PREROUTING DNS redirect rules for each hotspot interface (udp+tcp port 53 REDIRECT to cfg.DNSPort)",
+    "In internal/iptables/iptables.go Cleanup() function: Add Phase for IPv6 V6BLOCK cleanup - remove jump from mangle OUTPUT, flush and delete the V6BLOCK chain using run6Ignore()",
+    "In internal/iptables/iptables.go Cleanup() function: Add Phase for DNS nat cleanup - remove jump from nat OUTPUT, flush and delete DNS chain. Also remove PREROUTING DNS redirect rules for hotspot interfaces (both udp and tcp on port 53)",
+    "In internal/dnsx/dnsx.go AndroidCarrierDNS() function: Add more HyperOS-specific properties to the props slice: net.rmnet_data3.dns1, net.rmnet_data3.dns2, net.rmnet_data4.dns1, net.rmnet_data4.dns2, net.rmnet_data5.dns1, net.rmnet_data5.dns2, persist.net.dns1, persist.net.dns2",
+    "In src/module/scripts/net_clean.sh: Add SSHC_V6BLOCK to the CHAINS list. Add a clean_v6_mangle() function that removes the SSHC_V6BLOCK chain from ip6tables mangle table (delete jump from OUTPUT, flush, delete chain). Add a clean_dns_nat() function that cleans DNS nat rules (delete jump from OUTPUT, flush DNS chain, delete chain, and remove PREROUTING hotspot DNS redirects for all interfaces). Call both new functions from the main flow between clean_v6 and the log complete line.",
+    "In cmd/sshcustomd/main.go iptablesCfgFromConfig() function: Add DNSPort: cfg.TransparentProxy.DNSPort, HotspotDNS: cfg.Hotspot.Enabled && cfg.Hotspot.DNS, to the returned iptables.Config struct"
+  ],
+  "acceptance_criteria": [
+    "go test ./... passes with no failures",
+    "go build ./cmd/sshcustomd/ compiles successfully",
+    "The iptables.Config struct has DNSPort and HotspotDNS fields",
+    "Apply() installs ip6tables mangle V6BLOCK chain rules",
+    "Apply() installs iptables nat DNS redirect rules when DNSPort > 0",
+    "Cleanup() removes V6BLOCK and DNS chains",
+    "AndroidCarrierDNS props list includes rmnet_data3-5 and persist.net.dns properties",
+    "net_clean.sh includes SSHC_V6BLOCK in CHAINS and has clean_v6_mangle/clean_dns_nat functions"
+  ],
+  "verification": [
+    "Run go test ./... from /projects/sandbox/SSHCustom-Magisk and confirm all tests pass",
+    "Run go build ./cmd/sshcustomd/ and confirm it compiles without errors"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

@@ -2956,7 +2956,9 @@ func iptablesCfgFromConfig(cfg Config) iptables.Config {
 		TCPPort:       cfg.TransparentProxy.TCPPort,
 		APIPort:       cfg.API.Port,
 		SocksPort:     cfg.LocalProxy.SocksPort,
+		DNSPort:       cfg.TransparentProxy.DNSPort,
 		Hotspot:       cfg.Hotspot.Enabled && cfg.Hotspot.TCP,
+		HotspotDNS:    cfg.Hotspot.Enabled && cfg.Hotspot.DNS,
 		HotspotIfaces: cfg.Hotspot.Interfaces,
 	}
 }
