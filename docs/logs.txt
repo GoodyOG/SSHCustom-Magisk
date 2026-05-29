@@ -1,0 +1,30 @@
+2026/05/29 11:16:57.949567 SSHCustom daemon 2.2.6 starting (idle=true)
+2026/05/29 11:16:57.949647 profile="Sample SSH Direct" mode=direct payload=false ssh=example.com:22 user=user
+2026/05/29 11:16:57.949655 transport chain=tcp -> ssh
+2026/05/29 11:16:57.949658 dns mode=device servers=[]
+2026/05/29 11:16:57.954177 daemon started in idle mode (WebUI only); tunnel not started
+2026/05/29 11:16:57.958577 API listening on http://127.0.0.1:9190
+2026/05/29 11:18:50.996535 starting tunnel with profile "Sample SSH Direct" (mode=direct)
+2026/05/29 11:18:50.997952 SSH auth attempt #1 starting
+2026/05/29 11:18:50.998003 dial tcp www.bc.game:80 method=device_system_dns
+2026/05/29 11:18:51.547508 device/system hostname dial failed for www.bc.game:80: dial tcp: lookup www.bc.game on [::1]:53: read udp [::1]:56448->[::1]:53: read: connection refused
+2026/05/29 11:18:54.260824 dnsx: resolved www.bc.game via ping -c 1 -W 2 www.bc.game -> [104.18.28.120]
+2026/05/29 11:18:54.261079 dial tcp 104.18.28.120:80 host=www.bc.game method=android_shell_dns
+2026/05/29 11:18:54.394047 sending payload timing=before_ssh bytes=87
+2026/05/29 11:18:55.079520 server message: http/html banner suppressed (535 bytes)
+2026/05/29 11:18:55.226103 SSH authenticated: banner="SSH-2.0-dropbear_2022.83" http_statuses=[101] pool_size=1 max_streams_per_ssh=64
+2026/05/29 11:18:55.226645 SOCKS5 listening on 127.0.0.1:1080
+2026/05/29 11:19:00.870306 transparent TCP listening on 0.0.0.0:10810; iptables applied; hotspot_tcp=true
+2026/05/29 11:19:04.187186 SSH pool slot 1 connecting
+2026/05/29 11:19:04.187275 dial tcp www.bc.game:80 method=device_system_dns
+2026/05/29 11:19:04.188583 device/system hostname dial failed for www.bc.game:80: dial tcp: lookup www.bc.game on [::1]:53: read udp [::1]:48973->[::1]:53: read: connection refused
+2026/05/29 11:19:04.188638 dnsx: resolved www.bc.game from cache mode=device -> [104.18.28.120]
+2026/05/29 11:19:04.188684 dial tcp 104.18.28.120:80 host=www.bc.game method=dns_cached_android_shell_dns
+2026/05/29 11:19:04.327998 sending payload timing=before_ssh bytes=87
+2026/05/29 11:19:04.997357 server message: http/html banner suppressed (535 bytes)
+2026/05/29 11:19:05.161445 SSH pool slot 1 connected
+
+Home
+
+Profiles
+
