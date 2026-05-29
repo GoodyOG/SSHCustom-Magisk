@@ -1,0 +1,25 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Add DNS forwarder to cmd/sshcustomd/main.go that accepts DNS queries via UDP/TCP, forwards through SSH tunnel, and strips AAAA records from responses",
+  "status": "completed",
+  "steps": [
+    "In cmd/sshcustomd/main.go: Add a startDNSForwarder function with signature func startDNSForwarder(ctx context.Context, pool *SSHPool, cfg Config, st *State) func(). It should: (1) check if cfg.DNS.Hijack is true and cfg.TransparentProxy.DNSPort > 0, otherwise return nil, (2) listen on UDP and TCP on 0.0.0.0:cfg.TransparentProxy.DNSPort, (3) for each incoming UDP packet, spawn a goroutine that opens a TCP connection to 1.1.1.1:53 via pool.Dial(ctx, 'tcp', '1.1.1.1:53'), wraps the query with 2-byte TCP length prefix, reads the response (2-byte len prefix + data), calls filterAAAA() on the response, and sends the filtered response back to the UDP client, (4) for each incoming TCP connection, read queries (2-byte length-prefixed), forward through SSH to 1.1.1.1:53, filter AAAA, write back, (5) return a cleanup function that closes the listeners",
+    "In cmd/sshcustomd/main.go: Add a filterAAAA function with signature func filterAAAA(msg []byte) []byte. It should parse the DNS response minimally: (1) if msg is less than 12 bytes, return as-is, (2) read QDCOUNT from header bytes 4-5, ANCOUNT from bytes 6-7, (3) skip the question section (for each question: read labels until null byte, skip 4 bytes for QTYPE+QCLASS), (4) iterate over answer records: for each, read NAME (handle compression pointers - if first 2 bits are 11, it's a 2-byte pointer), read TYPE (2 bytes), CLASS (2 bytes), TTL (4 bytes), RDLENGTH (2 bytes), RDATA (RDLENGTH bytes). If TYPE == 28 (AAAA), remove the entire record and decrement ANCOUNT, (5) rebuild the message with updated ANCOUNT, (6) if any parsing error occurs, return the original message unmodified",
+    "In cmd/sshcustomd/main.go: Wire startDNSForwarder into the tunnel lifecycle. Right BEFORE the call to startTransparentIfEnabled (around line 1321), add: stopDNS := startDNSForwarder(ctx, pool, cfg, st). In the stopActive function (around line 1335), add stopDNS cleanup call (checking for nil before calling)."
+  ],
+  "acceptance_criteria": [
+    "go test ./... passes with no failures",
+    "go build ./cmd/sshcustomd/ compiles successfully",
+    "GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/sshcustomd/ cross-compiles successfully",
+    "filterAAAA correctly removes AAAA records (TYPE 28) from DNS response bytes while preserving A records",
+    "startDNSForwarder returns nil when DNS hijack is disabled",
+    "startDNSForwarder handles both UDP and TCP DNS queries"
+  ],
+  "verification": [
+    "Run go test ./... from /projects/sandbox/SSHCustom-Magisk and confirm all tests pass",
+    "Run GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/sshcustomd/ and confirm cross-compilation succeeds"
+  ],
+  "blocked_reason": null,
+  "findings": "All tests pass. Cross-compilation for arm64 succeeds. The DNS forwarder functions (startDNSForwarder, forwardDNSQuery, handleDNSTCP, filterAAAA, skipDNSName) added at end of main.go. Wired into lifecycle between stopSocks and stopTransparent. No encoding/binary import needed since manual byte shifting is used."
+}
