@@ -1318,6 +1318,7 @@ func connectionManager(ctx context.Context, cfg Config, p Profile, st *State) {
 		log.Printf("SSH authenticated: banner=%q http_statuses=%v pool_size=%d max_streams_per_ssh=%d", res.Banner, res.Statuses, pool.Size(), pool.MaxStreams())
 
 		stopSocks := startSocksIfEnabled(ctx, cfg, pool, st)
+		stopDNS := startDNSForwarder(ctx, pool, cfg, st)
 		stopTransparent := startTransparentIfEnabled(ctx, cfg, pool, st, res)
 		// Keepalive default 15s — Cloudflare and most CDNs RST idle
 		// HTTP-upgraded connections after ~50-60s, so we must probe well
@@ -1334,6 +1335,10 @@ func connectionManager(ctx context.Context, cfg Config, p Profile, st *State) {
 			if stopTransparent != nil {
 				stopTransparent()
 				stopTransparent = nil
+			}
+			if stopDNS != nil {
+				stopDNS()
+				stopDNS = nil
 			}
 			if stopSocks != nil {
 				stopSocks()
@@ -3982,4 +3987,263 @@ func readSOCKS5ConnectReply(r io.Reader) error {
 	}
 	_, err := io.CopyN(io.Discard, r, 2)
 	return err
+}
+
+func startDNSForwarder(ctx context.Context, pool *SSHPool, cfg Config, st *State) func() {
+	if !cfg.DNS.Hijack || cfg.TransparentProxy.DNSPort <= 0 {
+		return nil
+	}
+	port := cfg.TransparentProxy.DNSPort
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
+
+	// UDP listener
+	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		log.Printf("dns forwarder: failed to resolve UDP addr %s: %v", addr, err)
+		return nil
+	}
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		log.Printf("dns forwarder: UDP listen on %s failed: %v", addr, err)
+		return nil
+	}
+
+	// TCP listener
+	tcpLn, err := net.Listen("tcp4", addr)
+	if err != nil {
+		log.Printf("dns forwarder: TCP listen on %s failed: %v", addr, err)
+		udpConn.Close()
+		return nil
+	}
+
+	log.Printf("dns forwarder: listening on %s (UDP+TCP), forwarding via SSH to 1.1.1.1:53", addr)
+
+	// UDP goroutine
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, clientAddr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if !strings.Contains(err.Error(), "use of closed") {
+					log.Printf("dns forwarder: UDP read error: %v", err)
+				}
+				return
+			}
+			query := make([]byte, n)
+			copy(query, buf[:n])
+			go func(q []byte, cAddr *net.UDPAddr) {
+				resp := forwardDNSQuery(ctx, pool, q)
+				if resp != nil {
+					filtered := filterAAAA(resp)
+					udpConn.WriteToUDP(filtered, cAddr)
+				}
+			}(query, clientAddr)
+		}
+	}()
+
+	// TCP goroutine
+	go func() {
+		for {
+			conn, err := tcpLn.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if !strings.Contains(err.Error(), "use of closed") {
+					log.Printf("dns forwarder: TCP accept error: %v", err)
+				}
+				return
+			}
+			go handleDNSTCP(ctx, conn, pool)
+		}
+	}()
+
+	return func() {
+		udpConn.Close()
+		tcpLn.Close()
+		log.Printf("dns forwarder: stopped")
+	}
+}
+
+// forwardDNSQuery sends a DNS query through the SSH tunnel to 1.1.1.1:53 using DNS-over-TCP framing.
+func forwardDNSQuery(ctx context.Context, pool *SSHPool, query []byte) []byte {
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := pool.Dial(dialCtx, "tcp", "1.1.1.1:53")
+	if err != nil {
+		log.Printf("dns forwarder: SSH dial to 1.1.1.1:53 failed: %v", err)
+		return nil
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Write DNS-over-TCP: 2-byte length prefix + query
+	lenBuf := make([]byte, 2)
+	lenBuf[0] = byte(len(query) >> 8)
+	lenBuf[1] = byte(len(query))
+	if _, err := conn.Write(lenBuf); err != nil {
+		return nil
+	}
+	if _, err := conn.Write(query); err != nil {
+		return nil
+	}
+
+	// Read response: 2-byte length prefix
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return nil
+	}
+	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+	if respLen <= 0 || respLen > 4096 {
+		return nil
+	}
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil
+	}
+	return resp
+}
+
+// handleDNSTCP handles a single TCP DNS client connection.
+func handleDNSTCP(ctx context.Context, conn net.Conn, pool *SSHPool) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Read length-prefixed queries in a loop (TCP DNS can pipeline)
+	lenBuf := make([]byte, 2)
+	for {
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		qLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+		if qLen <= 0 || qLen > 4096 {
+			return
+		}
+		query := make([]byte, qLen)
+		if _, err := io.ReadFull(conn, query); err != nil {
+			return
+		}
+
+		resp := forwardDNSQuery(ctx, pool, query)
+		if resp == nil {
+			return
+		}
+		filtered := filterAAAA(resp)
+
+		// Write length-prefixed response
+		respLenBuf := make([]byte, 2)
+		respLenBuf[0] = byte(len(filtered) >> 8)
+		respLenBuf[1] = byte(len(filtered))
+		if _, err := conn.Write(respLenBuf); err != nil {
+			return
+		}
+		if _, err := conn.Write(filtered); err != nil {
+			return
+		}
+	}
+}
+
+// filterAAAA removes AAAA (type 28) records from a DNS response message.
+// If parsing fails at any point, returns the original message unmodified.
+func filterAAAA(msg []byte) []byte {
+	if len(msg) < 12 {
+		return msg
+	}
+
+	// Parse header
+	qdcount := int(msg[4])<<8 | int(msg[5])
+	ancount := int(msg[6])<<8 | int(msg[7])
+	if ancount == 0 {
+		return msg
+	}
+
+	// Skip question section
+	offset := 12
+	for i := 0; i < qdcount; i++ {
+		off, ok := skipDNSName(msg, offset)
+		if !ok {
+			return msg
+		}
+		offset = off + 4 // QTYPE(2) + QCLASS(2)
+		if offset > len(msg) {
+			return msg
+		}
+	}
+
+	// Process answer section - rebuild without AAAA records
+	var result []byte
+	result = append(result, msg[:offset]...)
+	newAncount := 0
+
+	for i := 0; i < ancount; i++ {
+		recordStart := offset
+		// Skip NAME
+		off, ok := skipDNSName(msg, offset)
+		if !ok {
+			return msg
+		}
+		offset = off
+		if offset+10 > len(msg) {
+			return msg
+		}
+		rtype := int(msg[offset])<<8 | int(msg[offset+1])
+		// Skip TYPE(2) + CLASS(2) + TTL(4) = 8 bytes to get to RDLENGTH
+		rdlen := int(msg[offset+8])<<8 | int(msg[offset+9])
+		offset += 10 + rdlen
+		if offset > len(msg) {
+			return msg
+		}
+
+		if rtype == 28 {
+			// AAAA record - skip it
+			continue
+		}
+		result = append(result, msg[recordStart:offset]...)
+		newAncount++
+	}
+
+	// Append remaining sections (authority + additional) unchanged
+	if offset < len(msg) {
+		result = append(result, msg[offset:]...)
+	}
+
+	// Update ANCOUNT in header
+	result[6] = byte(newAncount >> 8)
+	result[7] = byte(newAncount)
+
+	return result
+}
+
+// skipDNSName advances past a DNS name at the given offset, handling both
+// label sequences and compression pointers. Returns the new offset and success.
+func skipDNSName(msg []byte, offset int) (int, bool) {
+	if offset >= len(msg) {
+		return 0, false
+	}
+	for {
+		if offset >= len(msg) {
+			return 0, false
+		}
+		b := msg[offset]
+		if b == 0 {
+			// End of name
+			return offset + 1, true
+		}
+		if b&0xC0 == 0xC0 {
+			// Compression pointer - 2 bytes total
+			if offset+1 >= len(msg) {
+				return 0, false
+			}
+			return offset + 2, true
+		}
+		// Label: length byte + that many chars
+		labelLen := int(b)
+		offset += 1 + labelLen
+	}
 }
