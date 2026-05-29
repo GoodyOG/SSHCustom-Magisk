@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Add IPv6 blocking and DNS redirect rules to iptables package, expand DNS property list in dnsx, and add net_clean.sh support for new chains",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "In internal/iptables/iptables.go: Add DNSPort int and HotspotDNS bool fields to the Config struct",
     "In internal/iptables/iptables.go: Add run6() helper function that calls ip6tables with -w 5 and retry logic (same pattern as run() but uses ip6tables binary)",
@@ -31,5 +31,5 @@
     "Run go build ./cmd/sshcustomd/ and confirm it compiles without errors"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All tests pass. Cross-compilation for arm64 and armv7 succeeds. The sshcustomd binary built without issues. No pre-existing test failures."
 }
