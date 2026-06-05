@@ -30,6 +30,14 @@ A transparent SSH tunnel proxy for rooted Android devices. Route all device traf
 4. Open your web browser and navigate to `http://127.0.0.1:9190`.
 5. Add your SSH server profile in the Profiles tab and tap **Start Tunnel**.
 
+**Accessing the WebUI:**
+
+- **KernelSU / KSU-Next** — open the module WebUI directly from the manager.
+- **WebUI-X Portable** — install [WebUI-X Portable](https://github.com/MMRLApp/WebUI-X-Portable) (also available on [Google Play](https://play.google.com/store/apps/details?id=com.dergoogler.mmrl.wx)). SSHCustom-Magisk appears in its module list with full edge-to-edge support. You can also **add a home screen shortcut** for instant access from the app's module list.
+- **Magisk** — install [KsuWebUI Standalone](https://github.com/KOWX712/KsuWebUIStandalone/releases), grant it root access, then open SSHCustom's WebUI from within it.
+- **Browser** — navigate to `http://127.0.0.1:9190/` on the device.
+
+
 ## 🛠️ Building from Source
 Ensure you have Go 1.21+ and Python 3.8+ installed.
 ```bash
