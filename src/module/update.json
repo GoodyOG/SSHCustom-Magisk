@@ -1,0 +1,6 @@
+{
+  "version": "v2.2.0",
+  "versionCode": 20200,
+  "zipUrl": "https://github.com/GoodyOG/SSHCustom-Magisk/releases/latest/download/SSHCustom-Magisk-v2.2.0.zip",
+  "changelog": "v2.2.0: Always-on daemon — WebUI accessible after boot without starting tunnel. Start/Stop/Restart tunnel from WebUI. Tunnel-based status in module managers (KSU/WebUI-X). Polished Runtime tab. Tunnel Uptime tracking."
+}

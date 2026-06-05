@@ -1,0 +1,25 @@
+# Build outputs
+dist/
+
+# Go
+*.test
+*.prof
+sshcustomd-host
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Backups
+*.bak
+*.tmp
