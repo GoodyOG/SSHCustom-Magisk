@@ -46,7 +46,9 @@ clean_v4() {
 }
 
 clean_v6() {
-  for C in $CHAINS; do
+  for C in $CHAINS SSHC_DROP6; do
+    run $IP6T -t filter -D OUTPUT -j "$C"
+    run $IP6T -t filter -D FORWARD -j "$C"
     run $IP6T -t nat -D OUTPUT -p tcp -j "$C"
     run $IP6T -t nat -D OUTPUT -j "$C"
     run $IP6T -t nat -D PREROUTING -p tcp -j "$C"
@@ -56,9 +58,11 @@ clean_v6() {
       run $IP6T -t nat -D PREROUTING -i "$IF" -j "$C"
     done
   done
-  for C in $CHAINS; do
+  for C in $CHAINS SSHC_DROP6; do
     run $IP6T -t nat -F "$C"
     run $IP6T -t nat -X "$C"
+    run $IP6T -t filter -F "$C"
+    run $IP6T -t filter -X "$C"
   done
 }
 

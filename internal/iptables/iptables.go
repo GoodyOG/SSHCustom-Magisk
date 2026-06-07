@@ -121,6 +121,10 @@ func ipt(args ...string) *exec.Cmd {
 	return exec.Command("iptables", append([]string{"-w", "100"}, args...)...)
 }
 
+func ip6t(args ...string) *exec.Cmd {
+	return exec.Command("ip6tables", append([]string{"-w", "100"}, args...)...)
+}
+
 // Apply installs the REDIRECT chains, DNS-through-tunnel, QUIC block, IPv6
 // disable, TCP tuning, and captive-portal bypass. bypassIPs are the resolved
 // SSH endpoint IPs that must not be caught by the REDIRECT rule.
@@ -317,15 +321,19 @@ func setupDNSForward(prefix string, port int) {
 }
 
 // blockQUIC drops outbound UDP/443 and UDP/80. REDIRECT only catches TCP, so
-// without this QUIC traffic escapes the tunnel entirely. DROP (not REJECT) is
-// used because ipt_REJECT is not reliably available on Android kernels —
-// vpnchain's own source documents this. DROP causes apps to wait for timeout
-// before falling back to TCP; on a fast Android kernel this is typically 1-3s
-// which is acceptable and identical to vpnchain's behaviour.
+// without this QUIC traffic escapes the tunnel entirely. Try REJECT first so 
+// browsers fall back to TCP immediately. If REJECT is unsupported, use DROP.
 func blockQUIC() {
 	for _, port := range []string{"443", "80"} {
-		if ipt("-t", "filter", "-C", "OUTPUT", "-p", "udp", "--dport", port, "-j", "DROP").Run() != nil {
-			_ = ipt("-t", "filter", "-A", "OUTPUT", "-p", "udp", "--dport", port, "-j", "DROP").Run()
+		// Use REJECT first because it falls back to TCP instantaneously without stalling apps like YouTube or Chrome.
+		// ipt_REJECT is not available on some Android kernels, so we gracefully fallback to DROP.
+		if ipt("-t", "filter", "-C", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT", "--reject-with", "icmp-port-unreachable").Run() != nil {
+			if ipt("-t", "filter", "-A", "OUTPUT", "-p", "udp", "--dport", port, "-j", "REJECT", "--reject-with", "icmp-port-unreachable").Run() != nil {
+				// Fallback to DROP
+				if ipt("-t", "filter", "-C", "OUTPUT", "-p", "udp", "--dport", port, "-j", "DROP").Run() != nil {
+					_ = ipt("-t", "filter", "-A", "OUTPUT", "-p", "udp", "--dport", port, "-j", "DROP").Run()
+				}
+			}
 		}
 	}
 }
@@ -358,15 +366,43 @@ func shRun(cmdline string) {
 
 // disableIPv6 turns off IPv6 system-wide so no traffic leaks past the
 // IPv4-only REDIRECT path. Also enables ip_forward (needed for hotspot).
+// Since Android netd often overrides sysctl, we aggressively block IPv6
+// through ip6tables to forcefully fail connections and trigger IPv4 fallback.
 func disableIPv6() {
 	shRun(`sysctl -w net.ipv4.ip_forward=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/ip_forward
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6`)
+
+	chain := "SSHC_DROP6"
+	if ip6t("-t", "filter", "-L", chain, "-n").Run() != nil {
+		_ = ip6t("-t", "filter", "-N", chain).Run()
+	}
+	_ = ip6t("-t", "filter", "-F", chain).Run()
+	
+	// Exempt loopback to prevent breaking local daemon communication
+	_ = ip6t("-t", "filter", "-A", chain, "-o", "lo", "-j", "RETURN").Run()
+	
+	// REJECT forces immediate TCP fallback in browsers instead of stalling
+	if ip6t("-t", "filter", "-A", chain, "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited").Run() != nil {
+		_ = ip6t("-t", "filter", "-A", chain, "-j", "DROP").Run()
+	}
+
+	_ = ip6t("-t", "filter", "-D", "OUTPUT", "-j", chain).Run()
+	_ = ip6t("-t", "filter", "-I", "OUTPUT", "1", "-j", chain).Run()
+	
+	_ = ip6t("-t", "filter", "-D", "FORWARD", "-j", chain).Run()
+	_ = ip6t("-t", "filter", "-I", "FORWARD", "1", "-j", chain).Run()
 }
 
 func enableIPv6() {
 	shRun(`sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
 sysctl -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || echo 0 > /proc/sys/net/ipv6/conf/default/disable_ipv6`)
+
+	chain := "SSHC_DROP6"
+	_ = ip6t("-t", "filter", "-D", "OUTPUT", "-j", chain).Run()
+	_ = ip6t("-t", "filter", "-D", "FORWARD", "-j", chain).Run()
+	_ = ip6t("-t", "filter", "-F", chain).Run()
+	_ = ip6t("-t", "filter", "-X", chain).Run()
 }
 
 // disableCaptivePortal sets the captive-portal settings to use Google's real
@@ -390,14 +426,19 @@ sysctl -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || echo 0 > /proc/sys
 // A non-disruptive reevaluate is fired once per session as a safety net in
 // case Android already cached a stale "no internet" verdict before this ran.
 func disableCaptivePortal() {
-	// Localhost strategy: works for ALL network types (bug-host and zero-bug-host).
-	// The daemon runs a 204 server on 127.0.0.1:80 that answers instantly,
-	// so Android's NetworkMonitor probe succeeds immediately without racing
-	// the SSH tunnel. captive_portal_http_url points to our local server.
+	// Strategy change from localhost to real URLs:
+	//   - localhost 204 server works on BUG-HOST networks (carrier injects responses)
+	//   - Real Google URLs work on ZERO-BUG-HOST networks (clean carrier, no injection)
+	//   - The probe goes through the tunnel → reaches real Google → gets 204 → validated
+	//
+	// We use connectivitycheck.gstatic.com for HTTP and www.google.com for HTTPS
+	// because these are Android's default probe targets. The DNS tunnel ensures
+	// these domains resolve correctly, and the transparent proxy rules catch the
+	// probe traffic and route it through the SSH tunnel.
 	shRun(`settings put global captive_portal_mode 0
 settings put global captive_portal_use_https 0
-settings put global captive_portal_server localhost
-settings put global captive_portal_http_url "http://127.0.0.1:80/generate_204"
+settings put global captive_portal_server connectivitycheck.gstatic.com
+settings put global captive_portal_http_url "http://connectivitycheck.gstatic.com/generate_204"
 settings delete global captive_portal_https_url 2>/dev/null || true
 ndc resolver clearnetdns 2>/dev/null || true`)
 	kickRevalidation()
