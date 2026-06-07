@@ -390,11 +390,15 @@ sysctl -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || echo 0 > /proc/sys
 // A non-disruptive reevaluate is fired once per session as a safety net in
 // case Android already cached a stale "no internet" verdict before this ran.
 func disableCaptivePortal() {
+	// Localhost strategy: works for ALL network types (bug-host and zero-bug-host).
+	// The daemon runs a 204 server on 127.0.0.1:80 that answers instantly,
+	// so Android's NetworkMonitor probe succeeds immediately without racing
+	// the SSH tunnel. captive_portal_http_url points to our local server.
 	shRun(`settings put global captive_portal_mode 0
 settings put global captive_portal_use_https 0
-settings delete global captive_portal_server 2>/dev/null || true
-settings put global captive_portal_http_url "http://connectivitycheck.gstatic.com/generate_204"
-settings put global captive_portal_https_url "https://www.google.com/generate_204"
+settings put global captive_portal_server localhost
+settings put global captive_portal_http_url "http://127.0.0.1:80/generate_204"
+settings delete global captive_portal_https_url 2>/dev/null || true
 ndc resolver clearnetdns 2>/dev/null || true`)
 	kickRevalidation()
 }
@@ -434,7 +438,7 @@ func kickRevalidation() {
 	go func() {
 		// 5s delay: let iptables rules, settings, and DNS forwarder fully stabilize
 		// so the probe has the best chance of succeeding on first attempt.
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 		
 		// Try multiple methods in order of preference:
 		// 1. Specific network ID (most reliable)

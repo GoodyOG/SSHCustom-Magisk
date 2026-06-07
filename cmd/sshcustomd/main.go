@@ -1056,28 +1056,23 @@ func run(args []string) {
 
 	// Captive-portal 204 server on localhost:80.
 	//
-	// Strategy update (v2.5.2):
-	//   - BUG-HOST networks (carrier HTTP injection): Use localhost 204 server
-	//   - ZERO-BUG-HOST networks (clean carrier): Use real Google probe URLs
-	//
-	// The daemon now sets captive_portal_http_url to Google's real endpoint
-	// (connectivitycheck.gstatic.com) which goes through the tunnel. This
-	// works for ZERO-BUG-HOST users where the probe needs to reach the actual
-	// endpoint to get a 204.
-	//
-	// We keep this localhost server for backward compatibility with bug-host
-	// networks where the carrier injects 302/204 responses. If users manually
-	// switch back to localhost URLs, this server will answer their probes.
-	//
-	// The server is optional (non-fatal if port :80 is taken) and uses
-	// SO_REUSEADDR. The daemon's uid-0 RETURN iptables rule exempts this
-	// server's own connections from the REDIRECT chain.
+	// Localhost 204 strategy (primary for all network types):
+	// captive_portal_http_url is set to http://127.0.0.1:80/generate_204 so
+	// Android's NetworkMonitor probe hits this server instantly and gets 204
+	// without racing the SSH tunnel. Works on both bug-host and zero-bug-host
+	// networks. The server is optional (non-fatal if port :80 is taken).
 	go func() {
 		captiveMux := http.NewServeMux()
-		captiveMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Handle both / and /generate_204 — Android probes use /generate_204 path.
+		// captive_portal_http_url is set to http://127.0.0.1:80/generate_204 so
+		// the probe hits this server directly, gets 204 instantly, and Android
+		// marks the network validated without racing the SSH tunnel.
+		captive204Handler := func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNoContent) // 204
-		})
+		}
+		captiveMux.HandleFunc("/", captive204Handler)
+		captiveMux.HandleFunc("/generate_204", captive204Handler)
 		captiveSrv := &http.Server{
 			Addr:              "127.0.0.1:80",
 			Handler:           captiveMux,
@@ -1087,10 +1082,10 @@ func run(args []string) {
 		captiveSrv.SetKeepAlivesEnabled(false)
 		captiveLn, err := net.Listen("tcp", "127.0.0.1:80")
 		if err != nil {
-			log.Printf("[captive-204] could not bind :80 (%v) — skipping localhost server (using real probe URLs)", err)
+			log.Printf("[captive-204] could not bind :80 (%v) — captive portal fix unavailable", err)
 			return
 		}
-		log.Printf("[captive-204] listening on 127.0.0.1:80 (fallback for bug-host networks)")
+		log.Printf("[captive-204] listening on 127.0.0.1:80/generate_204 (primary captive portal strategy)")
 		go func() {
 			<-ctx.Done()
 			_ = captiveSrv.Close()
