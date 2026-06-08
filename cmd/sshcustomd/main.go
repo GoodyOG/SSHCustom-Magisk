@@ -1290,7 +1290,7 @@ func isNetworkTransientError(err error) bool {
 		"network is unreachable", "no route to host", "connection timed out",
 		"i/o timeout", "context deadline exceeded", "operation was canceled",
 		"temporary failure in name resolution", "lookup", "dns",
-		"read udp [::1]", "connection refused",
+		"read udp [::1]", "connection refused", "reset by peer",
 	} {
 		if strings.Contains(s, needle) {
 			return true
@@ -1345,6 +1345,17 @@ func logTunnelOpenError(prefix, target string, err error) {
 	s := strings.ToLower(err.Error())
 	if strings.Contains(s, "bad record mac") || strings.Contains(s, "error decoding message") || strings.Contains(s, "use of closed network connection") || strings.Contains(s, "eof") {
 		log.Printf("%s failed target=%s: transport reset; reconnecting SSH session", prefix, target)
+		return
+	}
+	if strings.Contains(s, "connection timed out") || strings.Contains(s, "i/o timeout") {
+		packetErrCount.Lock()
+		packetErrCount.count++
+		if time.Since(packetErrCount.last) > 10*time.Second {
+			log.Printf("%s ssh connection timed out (x%d streams in last 10s): transport dead; will reconnect", prefix, packetErrCount.count)
+			packetErrCount.count = 0
+			packetErrCount.last = time.Now()
+		}
+		packetErrCount.Unlock()
 		return
 	}
 	// Suppress packet-too-large spam — log once per 10s with count
@@ -1623,13 +1634,13 @@ func tuneTCPConn(c net.Conn, cfg Config, serverSide bool) {
 		if serverSide {
 			// Carrier socket: set Linux TCP keepalive parameters so a
 			// dead link is detected quickly even under write congestion.
-			// TCP_USER_TIMEOUT (18): kernel resets the connection if any
-			// transmitted data remains unACKed for this long. 30 s means
-			// silent carrier drops are detected promptly.
-			// TCP_KEEPIDLE (4):  idle before first keepalive probe.
-			// TCP_KEEPINTVL (5): interval between subsequent probes.
-			// TCP_KEEPCNT  (6):  number of unanswered probes before dead.
-			setTCPTimeouts(tc, 30, 30, 10, 3)
+			// TCP_USER_TIMEOUT (30): kernel resets connection if any
+			// transmitted data remains unACKed for this long.
+			// TCP_KEEPIDLE (5):  idle before first keepalive probe.
+			// TCP_KEEPINTVL (3): interval between subsequent probes.
+			// TCP_KEEPCNT  (2):  number of unanswered probes before dead.
+			// Total dead detection: 5 + 3 + 3 = ~11s
+			setTCPTimeouts(tc, 30, 5, 3, 2)
 		}
 
 		// Deliberately NOT setting large SO_RCVBUF/SO_SNDBUF here. The old

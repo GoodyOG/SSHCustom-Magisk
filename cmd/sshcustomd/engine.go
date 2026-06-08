@@ -42,6 +42,7 @@ type tunClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	active int32
+	dead   atomic.Bool
 }
 
 func newTunClient(parent context.Context, sc *xssh.Client, keepaliveSec int) *tunClient {
@@ -76,20 +77,20 @@ func (c *tunClient) keepAlive(sec int) {
 			case err := <-done:
 				if err != nil {
 					missed++
-					if missed >= 3 {
-						_ = c.ssh.Close()
-						return
-					}
-				} else {
-					missed = 0
-				}
-			case <-time.After(5 * time.Second):
-				// Write blocked for >5 s — link is congested or dead
-				missed++
-				if missed >= 3 {
-					_ = c.ssh.Close()
+				if missed >= 2 {
+					c.MarkDead()
 					return
 				}
+			} else {
+				missed = 0
+			}
+			case <-time.After(5 * time.Second):
+			// Write blocked for >5 s — link is congested or dead
+			missed++
+			if missed >= 2 {
+				c.MarkDead()
+				return
+			}
 			}
 		}
 	}
@@ -103,8 +104,15 @@ func (c *tunClient) DialTCP(ctx context.Context, network, addr string) (net.Conn
 
 func (c *tunClient) add()        { atomic.AddInt32(&c.active, 1) }
 func (c *tunClient) remove()     { atomic.AddInt32(&c.active, -1) }
-func (c *tunClient) Active() int { return int(atomic.LoadInt32(&c.active)) }
-func (c *tunClient) Close()      { c.cancel(); _ = c.ssh.Close() }
+func (c *tunClient) Active() int   { return int(atomic.LoadInt32(&c.active)) }
+func (c *tunClient) IsDead() bool { return c.dead.Load() }
+func (c *tunClient) MarkDead() {
+	if c.dead.CompareAndSwap(false, true) {
+		log.Printf("[tunnel] marking SSH client dead — triggering reconnect")
+	}
+	c.Close()
+}
+func (c *tunClient) Close() { c.cancel(); _ = c.ssh.Close() }
 func (c *tunClient) Wait() error { return c.ssh.Wait() }
 
 // tunnelLoop is the connection manager: connect → bring listeners + iptables
@@ -346,27 +354,32 @@ func nextDelay(cur, base, max time.Duration) time.Duration {
 // always succeeds on the next attempt. Fail-closed: if the SSH client itself
 // is gone (nil), the call returns immediately without retrying.
 func dialStreamWithRetry(ctx context.Context, prefix string, cl *tunClient, target string, curClient func() *tunClient) (net.Conn, error) {
+	if cl.IsDead() {
+		return nil, fmt.Errorf("ssh client is dead")
+	}
 	remote, err := cl.DialTCP(ctx, "tcp", target)
 	if err == nil {
 		return remote, nil
 	}
+	if isTransportDeath(err) {
+		cl.MarkDead()
+		return nil, err
+	}
 	if !isStreamRetryable(err) {
 		return nil, err
 	}
-	for attempt := 1; attempt <= 2; attempt++ {
-		time.Sleep(time.Duration(attempt*300) * time.Millisecond)
-		cl = curClient()
-		if cl == nil {
-			return nil, err
-		}
-		remote, err = cl.DialTCP(ctx, "tcp", target)
-		if err == nil {
-			log.Printf("[%s] stream retry %d succeeded for %s", prefix, attempt, target)
-			return remote, nil
-		}
-		if !isStreamRetryable(err) {
-			return nil, err
-		}
+	ncl := curClient()
+	if ncl == nil || ncl.IsDead() {
+		return nil, err
+	}
+	time.Sleep(300 * time.Millisecond)
+	remote, err = ncl.DialTCP(ctx, "tcp", target)
+	if err == nil {
+		log.Printf("[%s] stream retry succeeded for %s", prefix, target)
+		return remote, nil
+	}
+	if isTransportDeath(err) {
+		ncl.MarkDead()
 	}
 	return nil, err
 }
@@ -376,12 +389,41 @@ func dialStreamWithRetry(ctx context.Context, prefix string, cl *tunClient, targ
 // rejection. These are worth retrying because they often resolve within a
 // few hundred milliseconds on the next attempt.
 func isStreamRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
 	s := err.Error()
 	return strings.Contains(s, "connect failed") ||
 		strings.Contains(s, "Connection refused") ||
 		strings.Contains(s, "Connection timed out") ||
 		strings.Contains(s, "Temporary failure in name resolution") ||
 		strings.Contains(s, "no route to host")
+}
+
+// isTransportDeath returns true for errors that indicate the SSH transport
+// (underlying TCP/TLS connection) is dead — not just a single stream failure.
+// When this happens, the tunClient should be marked dead immediately to trigger
+// reconnection without waiting for the keepalive goroutine.
+func isTransportDeath(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "timeout") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "connection timed out") ||
+		strings.Contains(s, "Connection timed out") ||
+		strings.Contains(s, "reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "unexpected packet") ||
+		strings.Contains(s, "bad record mac") ||
+		strings.Contains(s, "error decoding message") ||
+		strings.Contains(s, "packet too large") ||
+		strings.Contains(s, "invalid packet length") ||
+		strings.Contains(s, "ssh client is dead")
 }
 
 // startListeners brings up SOCKS5 + transparent (REDIRECT) + DNS forwarder,
@@ -440,13 +482,18 @@ func handleSOCKSClient(ctx context.Context, c net.Conn, cfg Config, curClient fu
 	_ = c.SetDeadline(time.Time{})
 	tuneTCPConn(c, cfg, false)
 	cl := curClient()
-	if cl == nil {
+	if cl == nil || cl.IsDead() {
 		_ = socks5Reply(c, 0x04) // host unreachable (reconnecting; fail-closed)
 		return
 	}
-	remote, err := dialStreamWithRetry(ctx, "socks5", cl, target, curClient)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 8*time.Second)
+	remote, err := dialStreamWithRetry(dialCtx, "socks5", cl, target, curClient)
+	dialCancel()
 	if err != nil {
 		logTunnelOpenError("[socks5]", target, err)
+		if isTransportDeath(err) {
+			cl.MarkDead()
+		}
 		_ = socks5Reply(c, 0x05)
 		return
 	}
@@ -502,12 +549,17 @@ func handleTransparentClient(ctx context.Context, c net.Conn, cfg Config, curCli
 	}
 	tuneTCPConn(c, cfg, false)
 	cl := curClient()
-	if cl == nil {
-		return // reconnecting — drop (fail-closed)
+	if cl == nil || cl.IsDead() {
+		return // reconnecting or dead — drop (fail-closed)
 	}
-	remote, err := dialStreamWithRetry(ctx, "transparent", cl, target, curClient)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 8*time.Second)
+	remote, err := dialStreamWithRetry(dialCtx, "transparent", cl, target, curClient)
+	dialCancel()
 	if err != nil {
 		logTunnelOpenError("[transparent]", target, err)
+		if isTransportDeath(err) {
+			cl.MarkDead()
+		}
 		return
 	}
 	defer remote.Close()
