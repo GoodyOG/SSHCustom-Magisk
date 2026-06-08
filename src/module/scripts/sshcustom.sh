@@ -18,14 +18,6 @@ mkdir -p "$RUN_DIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$CONTROL_LOG"; }
 
-set_desc() {
-  [ -f "$MODULE_PROP" ] || return 0
-  case "$1" in
-    running) sed -i 's/^description=.*/description=[ 🟢 ] SSHCustom-Magisk - running/' "$MODULE_PROP" 2>/dev/null ;;
-    paused) sed -i 's/^description=.*/description=[ 🟡 ] SSHCustom-Magisk - paused, waiting for network/' "$MODULE_PROP" 2>/dev/null ;;
-    *) sed -i 's/^description=.*/description=[ 🔴 ] SSHCustom-Magisk - stopped/' "$MODULE_PROP" 2>/dev/null ;;
-  esac
-}
 
 pid_alive() { PID="$1"; [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; }
 
@@ -141,7 +133,7 @@ stop_runtime() {
 
 start_module() {
   echo "starting sshcustom module..."
-  log "manual/action start v2.0.0"
+  log "manual/action start v2.7.0"
   mkdir -p "$RUN_DIR"
   : > "$CORE_LOG"
   echo "$(date '+%Y-%m-%d %H:%M:%S') core.log reset for fresh module start" >> "$CORE_LOG"
@@ -151,12 +143,10 @@ start_module() {
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
   if start_daemon; then
     start_watchdog
-    set_desc running
     echo "sshcustom module started"
     return 0
   fi
   echo "sshcustom module enabled, but runtime start failed"
-  set_desc stopped
   rm -f "$ENABLED_FILE"
   return 1
 }
@@ -169,7 +159,6 @@ stop_module() {
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
   sleep 1
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
-  set_desc stopped
   echo "sshcustom module stopped and network rules cleaned"
 }
 
@@ -182,7 +171,6 @@ start_idle_module() {
     return 0
   fi
   start_daemon --idle
-  set_desc stopped
   echo "sshcustom daemon started in idle mode (WebUI at 127.0.0.1:9190)"
 }
 
@@ -194,7 +182,6 @@ network_pause() {
   kill_named_daemon
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
   touch "$PAUSED_FILE"
-  set_desc paused
 }
 
 network_resume() {
@@ -208,11 +195,9 @@ network_resume() {
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
   if start_daemon; then
     start_watchdog
-    set_desc running
     echo "sshcustom runtime resumed"
   else
     touch "$PAUSED_FILE"
-    set_desc paused
     echo "sshcustom resume failed; left paused"
     return 1
   fi
@@ -237,7 +222,6 @@ boot_reset() {
   rm -f "$ENABLED_FILE" "$PAUSED_FILE"
   stop_runtime
   "$WORK_DIR/net_clean.sh" >> "$CONTROL_LOG" 2>&1
-  set_desc stopped
 }
 
 case "$1" in

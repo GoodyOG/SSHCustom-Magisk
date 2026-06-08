@@ -50,7 +50,7 @@ wait_api_ready() {
 }
 
 {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') boot service started (v2.2.0)"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') boot service started (v2.7.0)"
   until [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; do sleep 3; done
   echo "$(date '+%Y-%m-%d %H:%M:%S') boot completed; resetting to stopped state"
   [ -x "$WORK_DIR/sshcustom.sh" ] && "$WORK_DIR/sshcustom.sh" boot-reset

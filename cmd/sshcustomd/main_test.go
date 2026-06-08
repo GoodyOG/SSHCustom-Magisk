@@ -36,24 +36,6 @@ func TestNormalizeMode(t *testing.T) {
 	}
 }
 
-func TestNormalizeDNSMode(t *testing.T) {
-	cases := map[string]string{
-		"":           "device",
-		"system":     "device",
-		"DEVICE":     "device",
-		"default":    "device",
-		"google":     "google",
-		"cloudflare": "cloudflare",
-		"custom":     "custom",
-		"garbage":    "device",
-	}
-	for in, want := range cases {
-		if got := normalizeDNSMode(in); got != want {
-			t.Errorf("normalizeDNSMode(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestSlugify(t *testing.T) {
 	cases := map[string]string{
 		"":                  "",

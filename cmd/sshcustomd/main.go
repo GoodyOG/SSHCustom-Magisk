@@ -60,15 +60,11 @@ type Config struct {
 	DNS struct {
 		Enabled    bool     `json:"enabled"`
 		Mode       string   `json:"mode"`
-		Hijack     bool     `json:"hijack"`
-		DoH        bool     `json:"doh"`
 		Servers    []string `json:"servers"`
 		TimeoutSec int      `json:"timeout_seconds"`
-		Note       string   `json:"note"`
 	} `json:"dns"`
 	Transport struct {
 		SupportedModes []string `json:"supported_modes"`
-		PayloadIsCore  bool     `json:"payload_is_core_feature"`
 	} `json:"transport"`
 	LocalProxy struct {
 		SocksEnabled bool   `json:"socks_enabled"`
@@ -76,13 +72,15 @@ type Config struct {
 		SocksPort    int    `json:"socks_port"`
 	} `json:"local_proxy"`
 	TransparentProxy struct {
-		Enabled       bool   `json:"enabled"`
-		TCPPort       int    `json:"tcp_port"`
-		DNSPort       int    `json:"dns_port"`
-		UDPMode       string `json:"udp_mode"`
-		ChainsPrefix  string `json:"chains_prefix"`
-		ApplyAfterSSH bool   `json:"apply_after_ssh_connected"`
+		Enabled      bool `json:"enabled"`
+		TCPPort      int  `json:"tcp_port"`
+		UDPPort      int  `json:"udp_port"`
+		ChainsPrefix string `json:"chains_prefix"`
 	} `json:"transparent_proxy"`
+	UDPProxy struct {
+		Enabled    bool `json:"enabled"`
+		UDPGWPort  int  `json:"udpgw_port"`
+	} `json:"udp_proxy"`
 	Hotspot struct {
 		Enabled    bool     `json:"enabled"`
 		TCP        bool     `json:"tcp"`
@@ -192,6 +190,9 @@ type State struct {
 	TransparentAddr     string    `json:"transparent_addr"`
 	TransparentRunning  bool      `json:"transparent_running"`
 	TransparentApplied  bool      `json:"transparent_applied"`
+	UDPProxyEnabled     bool      `json:"udp_proxy_enabled"`
+	UDPProxyRunning     bool      `json:"udp_proxy_running"`
+	UDPGWPort           int       `json:"udpgw_port"`
 	HotspotRunning      bool      `json:"hotspot_running"`
 	CPUPercent          float64   `json:"cpu_percent"`
 	MemoryRSSBytes      uint64    `json:"memory_rss_bytes"`
@@ -323,6 +324,9 @@ func (s *State) Snapshot() map[string]any {
 		"transparent_addr":        s.TransparentAddr,
 		"transparent_running":     s.TransparentRunning,
 		"transparent_applied":     s.TransparentApplied,
+		"udp_proxy_enabled":       s.UDPProxyEnabled,
+		"udp_proxy_running":       s.UDPProxyRunning,
+		"udpgw_port":              s.UDPGWPort,
 		"hotspot_running":         s.HotspotRunning,
 		"cpu_percent":             s.CPUPercent,
 		"memory_rss_bytes":        s.MemoryRSSBytes,
@@ -567,9 +571,11 @@ func run(args []string) {
 		SocksAddr:          socksAddr(cfg),
 		TransparentEnabled: cfg.TransparentProxy.Enabled,
 		TransparentAddr:    transparentAddr(cfg),
+		UDPProxyEnabled:    cfg.UDPProxy.Enabled,
+		UDPGWPort:          cfg.UDPProxy.UDPGWPort,
 		DNSMode:            cfg.DNS.Mode,
 		DNSServers:         append([]string(nil), cfg.DNS.Servers...),
-		Note:               "v2.5.0: full audit — api health path fix, DNS DNAT dedup, nil-sp guard, fail-closed routing, DNS wait-on-reconnect, dnsx speed, stopTunnel race fix.",
+		Note:               "v2.7.0: TPROXY/UDP support, fast reconnect (5-16s detection), KSU fix, dead code removal, atomic module.prop writes.",
 	}
 
 	log.Printf("SSHCustom daemon %s starting (idle=%v)", Version, *idleMode)
@@ -602,6 +608,8 @@ func run(args []string) {
 			state.SocksAddr = socksAddr(next)
 			state.TransparentEnabled = next.TransparentProxy.Enabled
 			state.TransparentAddr = transparentAddr(next)
+			state.UDPProxyEnabled = next.UDPProxy.Enabled
+			state.UDPGWPort = next.UDPProxy.UDPGWPort
 			state.DNSMode = next.DNS.Mode
 			state.DNSServers = append([]string(nil), next.DNS.Servers...)
 			state.LastEvent = "configuration updated; restart may be required"
@@ -1075,24 +1083,37 @@ func run(args []string) {
 		var desc string
 		switch status {
 		case "running":
-			desc = "description=[ \U0001F7E2 ] SSHCustom-Magisk - running"
+			desc = "description=[ON] SSHCustom-Magisk - running"
 		case "standby":
-			desc = "description=[ \U0001F7E1 ] SSHCustom-Magisk - standby"
+			desc = "description=[--] SSHCustom-Magisk - standby"
 		default:
-			desc = "description=[ \U0001F534 ] SSHCustom-Magisk - disconnected"
+			desc = "description=[OFF] SSHCustom-Magisk - disconnected"
 		}
 		data, err := os.ReadFile(modulePropPath)
 		if err != nil {
 			return
 		}
 		lines := strings.Split(string(data), "\n")
+		found := false
 		for i, line := range lines {
 			if strings.HasPrefix(line, "description=") {
 				lines[i] = desc
+				found = true
 				break
 			}
 		}
-		_ = os.WriteFile(modulePropPath, []byte(strings.Join(lines, "\n")), 0644)
+		if !found {
+			return
+		}
+		out := strings.Join(lines, "\n")
+		tmp := modulePropPath + ".tmp"
+		if err := os.WriteFile(tmp, []byte(out), 0644); err != nil {
+			return
+		}
+		if err := os.Rename(tmp, modulePropPath); err != nil {
+			os.Remove(tmp)
+			return
+		}
 	}
 
 	var tunnelCancel context.CancelFunc
@@ -1138,7 +1159,6 @@ func run(args []string) {
 			state.LastEvent = "tunnel starting"
 			state.LastError = ""
 		})
-		updateModuleProp("running")
 		log.Printf("starting tunnel with profile %q (mode=%s)", sp.Name, sp.Transport.Mode)
 		go func() {
 			defer close(done)
@@ -1149,41 +1169,40 @@ func run(args []string) {
 			}()
 			tunnelLoop(tunnelCtx, getConfig, *sp, state, &sshClient)
 
-			if explicitStop.Load() || ctx.Err() != nil {
-				tunnelRunning.Store(false)
-				state.set(func() {
-					state.Running = false
-					state.Connected = false
-					state.SSHAuthenticated = false
-					state.TransportReady = false
-					state.TunnelStartedAt = time.Time{}
-					if state.State != "IDLE" {
-						state.State = "IDLE"
-						state.LastEvent = "tunnel stopped"
-					}
-				})
-				updateModuleProp("disconnected")
-				return
-			}
-
+		if explicitStop.Load() || ctx.Err() != nil {
 			tunnelRunning.Store(false)
-			if restartBackoff <= 0 {
-				restartBackoff = 2 * time.Second
-			}
-			delay := restartBackoff
-			restartBackoff *= 2
-			if restartBackoff > 60*time.Second {
-				restartBackoff = 60 * time.Second
-			}
-			log.Printf("tunnel exited unexpectedly; auto-restarting in %v...", delay)
-			select {
-			case <-ctx.Done():
-			case <-time.After(delay):
-			}
-			if ctx.Err() == nil && !explicitStop.Load() {
-				startTunnel()
-			}
-		}()
+			state.set(func() {
+				state.Running = false
+				state.Connected = false
+				state.SSHAuthenticated = false
+				state.TransportReady = false
+				state.TunnelStartedAt = time.Time{}
+				if state.State != "IDLE" {
+					state.State = "IDLE"
+					state.LastEvent = "tunnel stopped"
+				}
+			})
+			return
+		}
+
+		tunnelRunning.Store(false)
+		if restartBackoff <= 0 {
+			restartBackoff = 2 * time.Second
+		}
+		delay := restartBackoff
+		restartBackoff *= 2
+		if restartBackoff > 60*time.Second {
+			restartBackoff = 60 * time.Second
+		}
+		log.Printf("tunnel exited unexpectedly; auto-restarting in %v...", delay)
+		select {
+		case <-ctx.Done():
+		case <-time.After(delay):
+		}
+		if ctx.Err() == nil && !explicitStop.Load() {
+			startTunnel()
+		}
+	}()
 	}
 
 	stopTunnel = func() {
@@ -1225,15 +1244,18 @@ func run(args []string) {
 			state.PoolReconnecting = 0
 			state.PoolStreams = 0
 		})
-		updateModuleProp("disconnected")
 		log.Printf("tunnel stopped")
 	}
 
-	// Monitor state changes to sync module.prop with tunnel state
+	// Monitor state changes to sync module.prop with tunnel state.
+	// Rate-limited: max 1 write per 3s to avoid thrashing module.prop
+	// during startup/stop transitions. Daemon is the sole writer — the shell
+	// script no longer touches module.prop.
 	go func() {
 		ch, cleanup := state.Subscribe()
 		defer cleanup()
 		lastStatus := ""
+		var lastWrite time.Time
 		for {
 			select {
 			case <-ctx.Done():
@@ -1251,8 +1273,9 @@ func run(args []string) {
 					status = "disconnected"
 				}
 				state.mu.RUnlock()
-				if status != lastStatus {
+				if status != lastStatus && time.Since(lastWrite) > 3*time.Second {
 					lastStatus = status
+					lastWrite = time.Now()
 					updateModuleProp(status)
 				}
 			}
@@ -1264,7 +1287,6 @@ func run(args []string) {
 		startTunnel()
 	} else {
 		log.Printf("daemon started in idle mode (WebUI only); tunnel not started")
-		updateModuleProp("disconnected")
 	}
 
 	<-ctx.Done()
@@ -1281,39 +1303,7 @@ func run(args []string) {
 	log.Printf("SSHCustom daemon stopped")
 }
 
-func isNetworkTransientError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	for _, needle := range []string{
-		"network is unreachable", "no route to host", "connection timed out",
-		"i/o timeout", "context deadline exceeded", "operation was canceled",
-		"temporary failure in name resolution", "lookup", "dns",
-		"read udp [::1]", "connection refused", "reset by peer",
-	} {
-		if strings.Contains(s, needle) {
-			return true
-		}
-	}
-	return false
-}
 
-func isSSHTransportBroken(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "eof") ||
-		strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "unexpected packet") ||
-		strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "broken pipe") ||
-		strings.Contains(s, "bad record mac") ||
-		strings.Contains(s, "error decoding message") ||
-		strings.Contains(s, "packet too large") ||
-		strings.Contains(s, "invalid packet length")
-}
 
 func shortBannerLog(message string) string {
 	m := strings.TrimSpace(message)
@@ -1668,8 +1658,8 @@ func dialTCPResolved(ctx context.Context, cfg Config, host string, port int, fal
 		return c, addr, "literal_ip", []string{ip.String()}, err
 	}
 
-	if normalizeDNSMode(cfg.DNS.Mode) != "device" {
-		ips, method := resolveHostSmart(ctx, cfg, host)
+	if cfg.DNS.Mode != "device" {
+		ips, method := dnsx.ResolveHost(ctx, dnsx.Config{Mode: "device", Servers: nil}, host)
 		if len(ips) > 0 {
 			var lastErr error
 			for _, ip := range rotateIPs(ips) {
@@ -1705,7 +1695,7 @@ func dialTCPResolved(ctx context.Context, cfg Config, host string, port int, fal
 	log.Printf("device/system hostname dial failed for %s: %v", addr, err)
 
 	// Shell DNS with in-memory cache (5 min TTL) — avoids repeated ping subprocesses
-	ips, method := resolveHostSmart(ctx, cfg, host)
+	ips, method := dnsx.ResolveHost(ctx, dnsx.Config{Mode: "device", Servers: nil}, host)
 	if len(ips) == 0 {
 		// Last resort: use profile fallback IPs if configured and all DNS failed
 		if len(fallbackIPs) > 0 {
@@ -1741,22 +1731,7 @@ func dialTCPResolved(ctx context.Context, cfg Config, host string, port int, fal
 	return nil, net.JoinHostPort(ips[0], portStr), method, ips, lastErr
 }
 
-// dnsCache holds recently resolved IPs to avoid repeated ping subprocesses.
-// dnsCfgFromConfig converts the daemon's Config to the dnsx package's Config.
-// Centralizing this conversion in one place means future config schema
-// changes only have to update this single function.
-func dnsCfgFromConfig(cfg Config) dnsx.Config {
-	return dnsx.Config{
-		Mode:    dnsx.Mode(normalizeDNSMode(cfg.DNS.Mode)),
-		Servers: cfg.DNS.Servers,
-	}
-}
 
-// resolveHostSmart delegates to the dnsx package. The shim exists so the
-// call sites in this file (dialTCPResolved, etc.) don't need to be updated.
-func resolveHostSmart(ctx context.Context, cfg Config, host string) ([]string, string) {
-	return dnsx.ResolveHost(ctx, dnsCfgFromConfig(cfg), host)
-}
 
 func evictDNSCache(host string) { dnsx.EvictHost(host) }
 
@@ -1772,7 +1747,7 @@ func dialFallbackIPs(p Profile, host string) []string {
 	return dnsx.SanitizeIPv4List(out)
 }
 
-func sanitizeIPv4List(in []string) []string { return dnsx.SanitizeIPv4List(in) }
+
 func rotateIPs(in []string) []string        { return dnsx.RotateIPs(in) }
 func extractIPv4s(s string) []string        { return dnsx.ExtractIPv4s(s) }
 
@@ -2064,6 +2039,14 @@ func transparentAddr(cfg Config) string {
 	return net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
 }
 
+func transparentUDPAddr(cfg Config) string {
+	port := cfg.TransparentProxy.UDPPort
+	if port <= 0 {
+		port = 10811
+	}
+	return net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+}
+
 func isLocalOrBlockedTarget(target string, cfg Config) bool {
 	h, p, err := net.SplitHostPort(target)
 	if err != nil {
@@ -2087,6 +2070,7 @@ func iptablesCfgFromConfig(cfg Config) iptables.Config {
 	return iptables.Config{
 		ChainsPrefix:   cfg.TransparentProxy.ChainsPrefix,
 		TCPPort:        cfg.TransparentProxy.TCPPort,
+		UDPPort:        cfg.TransparentProxy.UDPPort,
 		APIPort:        cfg.API.Port,
 		SocksPort:      cfg.LocalProxy.SocksPort,
 		DNSForwardPort: dnsForwardPort,
@@ -2101,6 +2085,14 @@ func applyTransparentRules(cfg Config, bypassIPs []string) error {
 
 func cleanupTransparentRules(cfg Config) error {
 	return iptables.Cleanup(iptablesCfgFromConfig(cfg))
+}
+
+func applyTransparentUDPRules(cfg Config) error {
+	return iptables.ApplyUDP(iptablesCfgFromConfig(cfg))
+}
+
+func cleanupTransparentUDPRules(cfg Config) error {
+	return iptables.CleanupUDP(iptablesCfgFromConfig(cfg))
 }
 
 type SaveProfileRequest struct {
@@ -2143,69 +2135,22 @@ func normalizeConfig(cfg *Config) {
 	// custom can't change runtime behaviour.
 	cfg.DNS.Mode = "device"
 	cfg.DNS.Enabled = false
-	cfg.DNS.Hijack = false
-	cfg.DNS.DoH = false
 	cfg.DNS.Servers = nil
 	if cfg.DNS.TimeoutSec <= 0 {
 		cfg.DNS.TimeoutSec = 4
 	}
-	cfg.DNS.Note = "device DNS only; resolver mode selection removed in this build"
 	if len(cfg.Hotspot.Interfaces) == 0 {
 		cfg.Hotspot.Interfaces = []string{"wlan+", "swlan+", "ap+", "rndis+", "ncm+", "bt-pan+"}
 	}
 }
 
-func normalizeDNSMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "", "system", "device", "default":
-		return "device"
-	case "google", "cloudflare", "custom":
-		return strings.ToLower(strings.TrimSpace(mode))
-	default:
-		return "device"
-	}
-}
 
-func trimDNSServerPorts(in []string) []string {
-	out := make([]string, 0, len(in))
-	seen := map[string]bool{}
-	for _, s := range in {
-		host, _, err := net.SplitHostPort(s)
-		if err == nil {
-			s = host
-		}
-		s = strings.Trim(s, "[] ")
-		if net.ParseIP(s) == nil || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	return out
-}
 
 func applyConfigPatch(cfg Config, req apiv1.ConfigPatchRequest) (Config, []string, bool, error) {
 	next := cfg
 	var changed []string
 	restartRequired := false
-	if req.DNS != nil {
-		oldMode := normalizeDNSMode(next.DNS.Mode)
-		next.DNS.Mode = normalizeDNSMode(req.DNS.Mode)
-		if req.DNS.TimeoutSeconds > 0 {
-			next.DNS.TimeoutSec = req.DNS.TimeoutSeconds
-		}
-		if next.DNS.Mode == "custom" {
-			next.DNS.Servers = req.DNS.Servers
-			if len(normalizedDNSServers(next.DNS.Servers)) == 0 {
-				return cfg, nil, false, errors.New("custom DNS requires at least one valid resolver IP")
-			}
-		}
-		normalizeConfig(&next)
-		if oldMode != next.DNS.Mode || strings.Join(cfg.DNS.Servers, ",") != strings.Join(next.DNS.Servers, ",") || cfg.DNS.TimeoutSec != next.DNS.TimeoutSec {
-			changed = append(changed, "dns")
-			restartRequired = true
-		}
-	}
+
 	if req.Hotspot != nil {
 		before := next.Hotspot
 		if req.Hotspot.Enabled != nil {
@@ -2443,24 +2388,7 @@ func slugify(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func scheduleControl(workDir, action string) error {
-	action = strings.TrimSpace(strings.ToLower(action))
-	switch action {
-	case "start", "stop", "restart", "clean":
-	default:
-		return fmt.Errorf("unsupported action: %s", action)
-	}
-	control := filepath.Join(workDir, "sshcustom.sh")
-	if _, err := os.Stat(control); err != nil {
-		return err
-	}
-	cmd := exec.Command("/system/bin/sh", "-c", "sleep 0.3; '"+strings.ReplaceAll(control, "'", "'\\''")+"' "+action+" >/dev/null 2>&1 &")
-	if err := cmd.Start(); err != nil {
-		cmd = exec.Command("sh", "-c", "sleep 0.3; '"+strings.ReplaceAll(control, "'", "'\\''")+"' "+action+" >/dev/null 2>&1 &")
-		return cmd.Start()
-	}
-	return nil
-}
+
 
 func routeSignature(ri RouteInfo) string {
 	if !ri.Online {
@@ -2628,55 +2556,7 @@ func baseDialer(cfg Config) net.Dialer {
 	return net.Dialer{Timeout: timeout, KeepAlive: keepAlive}
 }
 
-func makeDialer(cfg Config) net.Dialer {
-	d := baseDialer(cfg)
-	if !cfg.DNS.Enabled {
-		return d
-	}
-	servers := normalizedDNSServers(cfg.DNS.Servers)
-	if len(servers) == 0 {
-		servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
-	}
-	dnsTimeout := time.Duration(secondsDefault(cfg.DNS.TimeoutSec, 4)) * time.Second
-	d.Resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var lastErr error
-			for _, server := range servers {
-				nd := net.Dialer{Timeout: dnsTimeout}
-				c, err := nd.DialContext(ctx, "udp", server)
-				if err == nil {
-					return c, nil
-				}
-				lastErr = err
-			}
-			if lastErr == nil {
-				lastErr = errors.New("no DNS servers configured")
-			}
-			return nil, lastErr
-		},
-	}
-	return d
-}
 
-func normalizedDNSServers(in []string) []string {
-	out := make([]string, 0, len(in))
-	seen := map[string]bool{}
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, _, err := net.SplitHostPort(s); err != nil {
-			s = net.JoinHostPort(s, "53")
-		}
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	return out
-}
 
 func routeInfo() RouteInfo {
 	// Pure-Go route detection: UDP connect triggers kernel route lookup
@@ -2711,16 +2591,7 @@ func routeInfo() RouteInfo {
 	return RouteInfo{Online: true, Raw: laddr, Src: src, Iface: iface}
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
-}
+
 
 func tlsVersionName(v uint16) string {
 	switch v {
@@ -2814,13 +2685,7 @@ func configSummary(cfg Config) map[string]any {
 			"host": cfg.API.Host,
 			"port": cfg.API.Port,
 		},
-		"dns": map[string]any{
-			"mode":            cfg.DNS.Mode,
-			"enabled":         cfg.DNS.Enabled,
-			"servers":         cfg.DNS.Servers,
-			"timeout_seconds": cfg.DNS.TimeoutSec,
-			"hijack":          cfg.DNS.Hijack,
-		},
+		"dns": map[string]any{"mode": cfg.DNS.Mode},
 		"hotspot": map[string]any{
 			"enabled":    cfg.Hotspot.Enabled,
 			"tcp":        cfg.Hotspot.TCP,

@@ -74,6 +74,7 @@ import (
 type Config struct {
 	ChainsPrefix   string
 	TCPPort        int
+	UDPPort        int
 	APIPort        int
 	SocksPort      int
 	DNSForwardPort int // local UDP DNS-through-tunnel forwarder port (0 = disabled)
@@ -496,4 +497,37 @@ func tuneTCP() {
 sysctl -w net.core.wmem_max=67108864 2>/dev/null || echo 67108864 > /proc/sys/net/core/wmem_max
 sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864" 2>/dev/null || echo "4096 87380 67108864" > /proc/sys/net/ipv4/tcp_rmem
 sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864" 2>/dev/null || echo "4096 65536 67108864" > /proc/sys/net/ipv4/tcp_wmem`)
+}
+
+// ApplyUDP installs UDP TPROXY rules in the mangle table for capturing
+// UDP traffic via TPROXY into the daemon's local listener.
+func ApplyUDP(cfg Config) error {
+	port := cfg.UDPPort
+	if port <= 0 {
+		port = 10811
+	}
+
+	// 1. Add policy routing rule: fwmark 1 -> table 100
+	exec.Command("/system/bin/sh", "-c", "ip rule add fwmark 0x1/0x1 table 100 2>/dev/null; ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
+
+	// 2. mangle PREROUTING: TPROXY UDP to our listener
+	ipt("-t", "mangle", "-N", "SSHC_UDP", "2>/dev/null").Run()
+	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", "53", "-j", "RETURN").Run() // skip DNS (forwarded separately)
+	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", strconv.Itoa(port), "-j", "RETURN").Run() // skip self
+	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "-j", "TPROXY", "--on-port", strconv.Itoa(port), "--tproxy-mark", "0x1/0x1").Run()
+	ipt("-t", "mangle", "-I", "PREROUTING", "1", "-j", "SSHC_UDP").Run()
+	return nil
+}
+
+// CleanupUDP removes the UDP TPROXY rules installed by ApplyUDP.
+func CleanupUDP(cfg Config) error {
+	port := cfg.UDPPort
+	if port <= 0 {
+		port = 10811
+	}
+	ipt("-t", "mangle", "-D", "PREROUTING", "-j", "SSHC_UDP", "2>/dev/null").Run()
+	ipt("-t", "mangle", "-F", "SSHC_UDP", "2>/dev/null").Run()
+	ipt("-t", "mangle", "-X", "SSHC_UDP", "2>/dev/null").Run()
+	exec.Command("/system/bin/sh", "-c", "ip rule del fwmark 0x1/0x1 table 100 2>/dev/null; ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
+	return nil
 }

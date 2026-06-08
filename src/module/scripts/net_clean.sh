@@ -98,10 +98,21 @@ restore_captive_portal() {
   run settings delete global captive_portal_https_url
 }
 
+clean_udp_tproxy() {
+  # Clean up mangle table TPROXY rules for UDP proxy
+  run $IPT -t mangle -D PREROUTING -j SSHC_UDP
+  run $IPT -t mangle -F SSHC_UDP
+  run $IPT -t mangle -X SSHC_UDP
+  # Clean policy routing rules
+  run ip rule del fwmark 0x1/0x1 table 100
+  run ip route del local 0.0.0.0/0 dev lo table 100
+}
+
 log "clean start"
 clean_v4
 clean_v6
 clean_quic
+clean_udp_tproxy
 restore_ipv6
 restore_captive_portal
 log "clean complete"

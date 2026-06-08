@@ -13,15 +13,11 @@
   "dns": {
     "enabled": false,
     "mode": "device",
-    "hijack": false,
-    "doh": false,
     "servers": [],
-    "timeout_seconds": 4,
-    "note": "Device DNS is default. Google, Cloudflare, and custom modes affect SSHCustom endpoint resolution only."
+    "timeout_seconds": 4
   },
   "transport": {
-    "supported_modes": ["direct","http_proxy","tls_sni","http_proxy_tls_sni"],
-    "payload_is_core_feature": true
+    "supported_modes": ["direct","http_proxy","tls_sni","http_proxy_tls_sni"]
   },
   "local_proxy": {
     "socks_enabled": true,
@@ -31,10 +27,12 @@
   "transparent_proxy": {
     "enabled": true,
     "tcp_port": 10810,
-    "dns_port": 10811,
-    "udp_mode": "disabled",
-    "chains_prefix": "SSHC",
-    "apply_after_ssh_connected": true
+    "udp_port": 10811,
+    "chains_prefix": "SSHC"
+  },
+  "udp_proxy": {
+    "enabled": false,
+    "udpgw_port": 7300
   },
   "hotspot": {
     "enabled": true,
@@ -48,6 +46,8 @@
     "keepalive_seconds": 15,
     "ssh_pool_size": 1,
     "max_streams_per_ssh": 256,
+    "stream_idle_timeout_seconds": 150,
+    "read_probe_timeout_seconds": 6,
     "verbose_transparent_logs": false
   }
 }

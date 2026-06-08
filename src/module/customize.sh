@@ -10,7 +10,7 @@ RUN_DIR="$WORK_DIR/run"
 CONFIG_DIR="$WORK_DIR/config"
 
 ui_print "****************************************"
-ui_print " SSHCustom-Magisk v2.0.0"
+ui_print " SSHCustom-Magisk v2.7.0"
 ui_print " Source rebuild + sustained throughput"
 ui_print "****************************************"
 

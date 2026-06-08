@@ -14,12 +14,6 @@ type HealthResponse struct {
 	Version string `json:"version"`
 }
 
-type DNSSettings struct {
-	Mode           string   `json:"mode"`
-	Servers        []string `json:"servers,omitempty"`
-	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
-}
-
 type HotspotSettings struct {
 	Enabled    *bool    `json:"enabled,omitempty"`
 	TCP        *bool    `json:"tcp,omitempty"`
@@ -28,7 +22,6 @@ type HotspotSettings struct {
 }
 
 type ConfigPatchRequest struct {
-	DNS     *DNSSettings     `json:"dns,omitempty"`
 	Hotspot *HotspotSettings `json:"hotspot,omitempty"`
 	Restart bool             `json:"restart,omitempty"`
 }

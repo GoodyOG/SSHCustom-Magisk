@@ -20,6 +20,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -127,6 +128,7 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 	var (
 		listenerCancel context.CancelFunc
 		iptablesUp     bool
+		iptablesUDPUp  bool
 	)
 	teardown := func() {
 		if listenerCancel != nil {
@@ -136,6 +138,10 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 		if iptablesUp {
 			_ = cleanupTransparentRules(getCfg())
 			iptablesUp = false
+		}
+		if iptablesUDPUp {
+			_ = cleanupTransparentUDPRules(getCfg())
+			iptablesUDPUp = false
 		}
 		clientPtr.Store(nil)
 	}
@@ -247,6 +253,13 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 						st.TransparentApplied = true
 						st.HotspotRunning = cfg.Hotspot.Enabled && cfg.Hotspot.TCP
 					})
+				}
+			}
+			if cfg.UDPProxy.Enabled {
+				if err := applyTransparentUDPRules(cfg); err != nil {
+					log.Printf("[tunnel] udp iptables apply failed: %v", err)
+				} else {
+					iptablesUDPUp = true
 				}
 			}
 		}
@@ -443,6 +456,9 @@ func startListeners(ctx context.Context, cfg Config, curClient func() *tunClient
 			log.Printf("[dns-forward] %v", err)
 		}
 	}()
+	if cfg.UDPProxy.Enabled {
+		go serveTransparentUDP(ctx, cfg, curClient, st)
+	}
 }
 
 func serveSOCKS(ctx context.Context, cfg Config, curClient func() *tunClient, st *State) {
@@ -678,4 +694,82 @@ func measureLatency(ctx context.Context, cl *tunClient, target string) (int64, e
 	}
 	_ = conn.Close()
 	return time.Since(start).Milliseconds(), nil
+}
+
+func serveTransparentUDP(ctx context.Context, cfg Config, curClient func() *tunClient, st *State) {
+	addr := transparentUDPAddr(cfg)
+	ln, err := listenTransparentUDP(ctx, addr)
+	if err != nil {
+		log.Printf("[udp-tproxy] listen %s: %v", addr, err)
+		st.set(func() { st.UDPProxyRunning = false; st.LastError = "UDP TPROXY listen failed: " + err.Error() })
+		return
+	}
+	defer ln.Close()
+	st.set(func() { st.UDPProxyRunning = true })
+	log.Printf("[udp-tproxy] listening on %s", addr)
+
+	udpgwPort := cfg.UDPProxy.UDPGWPort
+	if udpgwPort <= 0 {
+		udpgwPort = 7300
+	}
+	tunnel := newUDPGWTunnel(ctx, curClient, udpgwPort)
+	defer tunnel.Close()
+
+	flows := make(map[string]chan []byte)
+	var flowsMu sync.Mutex
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		data, src, dst, err := ln.recvFrom()
+		if err != nil {
+			if ctx.Err() != nil {
+				st.set(func() { st.UDPProxyRunning = false })
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			log.Printf("[udp-tproxy] recv: %v", err)
+			st.set(func() { st.UDPProxyRunning = false })
+			return
+		}
+
+		flowKey := src.String()
+
+		flowsMu.Lock()
+		ch, exists := flows[flowKey]
+		if !exists {
+			ch = tunnel.ResponseChan(flowKey)
+			flows[flowKey] = ch
+			go func(key string) {
+				select {
+				case <-time.After(udpgwFlowTimeout):
+				case <-ctx.Done():
+				}
+				flowsMu.Lock()
+				delete(flows, key)
+				flowsMu.Unlock()
+				tunnel.ReleaseResponse(key)
+			}(flowKey)
+		}
+		flowsMu.Unlock()
+
+		if err := tunnel.Send(dst.IP, dst.Port, data); err != nil {
+			log.Printf("[udp-tproxy] send: %v", err)
+			continue
+		}
+
+		go func(key string, src *net.UDPAddr, dst *net.UDPAddr, ch chan []byte) {
+			select {
+			case resp := <-ch:
+				ln.conn.WriteToUDP(resp, src)
+			case <-time.After(30 * time.Second):
+			case <-ctx.Done():
+			}
+		}(flowKey, src, dst, ch)
+	}
 }
