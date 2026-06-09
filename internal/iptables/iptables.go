@@ -326,18 +326,15 @@ func cleanupRules(cfg Config) {
 
 // setupPolicyRouting creates the fwmark-based routing table used by both TCP
 // and UDP TPROXY. Idempotent — errors from existing rules are suppressed.
-// Without the local route, TPROXY-marked packets destined for non-loopback
-// addresses are silently dropped by the kernel.
 func setupPolicyRouting() {
 	exec.Command("/system/bin/sh", "-c",
 		"ip rule add fwmark 0x1/0x1 table 100 pref 100 2>/dev/null; "+
 			"ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
 
-	// route_localnet=1 is REQUIRED for OUTPUT-marked packets that get
-	// re-routed through lo. Without it, the kernel drops packets with
-	// non-loopback destinations arriving on the loopback interface.
-	shRun(`sysctl -w net.ipv4.conf.lo.route_localnet=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/conf/lo/route_localnet`)
-	shRun(`sysctl -w net.ipv4.conf.all.route_localnet=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet`)
+	// route_localnet=1 is REQUIRED. Write directly to proc to avoid
+	// shell/sysctl availability issues on stripped Android ROMs.
+	os.WriteFile("/proc/sys/net/ipv4/conf/lo/route_localnet", []byte("1\n"), 0644)
+	os.WriteFile("/proc/sys/net/ipv4/conf/all/route_localnet", []byte("1\n"), 0644)
 }
 
 // setupDNSForward redirects device UDP:53 to 127.0.0.1:<port> (our DNS

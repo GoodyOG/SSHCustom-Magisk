@@ -7,29 +7,61 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 )
 
 const soIPTransparent = 19
 
-// setTransparent sets IP_TRANSPARENT sockopt so the socket can accept
-// packets with non-local destinations (TPROXY requirement).
-func setTransparent(fd int) error {
-	return syscall.SetsockoptInt(fd, syscall.SOL_IP, soIPTransparent, 1)
+// listenTransparentTCP creates a TCP listener with IP_TRANSPARENT using
+// raw syscalls. Avoids net.ListenConfig.Control which can be unreliable
+// on some Android kernel versions.
+func listenTransparentTCP(ctx context.Context, addr string) (net.Listener, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	if err != nil {
+		return nil, fmt.Errorf("tproxy socket: %w", err)
+	}
+
+	// IP_TRANSPARENT: accept packets with non-local destinations
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_IP, soIPTransparent, 1); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("tproxy IP_TRANSPARENT: %w", err)
+	}
+
+	// SO_REUSEADDR: allow quick restarts
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("tproxy SO_REUSEADDR: %w", err)
+	}
+
+	// Bind
+	sa := &syscall.SockaddrInet4{Port: tcpAddr.Port}
+	copy(sa.Addr[:], tcpAddr.IP.To4())
+	if err := syscall.Bind(fd, sa); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("tproxy bind: %w", err)
+	}
+
+	// Listen
+	if err := syscall.Listen(fd, 128); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("tproxy listen: %w", err)
+	}
+
+	// Wrap as net.Listener
+	f := os.NewFile(uintptr(fd), "tcp-tproxy")
+	defer f.Close()
+	return net.FileListener(f)
 }
 
-// listenTransparentTCP creates a TCP listener with IP_TRANSPARENT.
-func listenTransparentTCP(ctx context.Context, addr string) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var setErr error
-			c.Control(func(fd uintptr) {
-				setErr = setTransparent(int(fd))
-			})
-			return setErr
-		},
-	}
-	return lc.Listen(ctx, "tcp", addr)
+// setTransparent sets IP_TRANSPARENT sockopt on a file descriptor.
+func setTransparent(fd int) error {
+	return syscall.SetsockoptInt(fd, syscall.SOL_IP, soIPTransparent, 1)
 }
 
 // tproxyDst returns the original destination from a TPROXY-accepted TCP
