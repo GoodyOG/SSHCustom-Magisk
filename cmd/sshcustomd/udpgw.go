@@ -60,15 +60,17 @@ func readUDPGWFrame(r io.Reader) (net.IP, int, []byte, error) {
 
 // udpgwTunnel manages a persistent SSH channel to BadVPN UDPGW on the server.
 type udpgwTunnel struct {
-	mu       sync.Mutex
-	conn     net.Conn
-	cur      func() *tunClient
-	port     int
-	ctx      context.Context
-	cancel   context.CancelFunc
-	dead     bool
-	respCh   map[string]chan []byte
-	respMu   sync.Mutex
+	mu            sync.Mutex
+	conn          net.Conn
+	cur           func() *tunClient
+	port          int
+	ctx           context.Context
+	cancel        context.CancelFunc
+	dead          bool
+	failedOnce    bool
+	lastDialTry   time.Time
+	respCh        map[string]chan []byte
+	respMu        sync.Mutex
 }
 
 func newUDPGWTunnel(ctx context.Context, curClient func() *tunClient, udpgwPort int) *udpgwTunnel {
@@ -84,6 +86,8 @@ func newUDPGWTunnel(ctx context.Context, curClient func() *tunClient, udpgwPort 
 }
 
 // dial ensures the tunnel is connected, reconnecting if necessary.
+// On first failure, logs once and silently drops subsequent UDP traffic
+// until the next retry window.
 func (t *udpgwTunnel) dial() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -92,21 +96,35 @@ func (t *udpgwTunnel) dial() error {
 		return nil
 	}
 
+	if t.failedOnce {
+		if time.Since(t.lastDialTry) < 30*time.Second {
+			return fmt.Errorf("udpgw unavailable, retry in %v", 30*time.Second-time.Since(t.lastDialTry))
+		}
+	}
+
 	cl := t.cur()
 	if cl == nil || cl.IsDead() {
 		return fmt.Errorf("ssh client unavailable")
 	}
 
+	t.lastDialTry = time.Now()
 	target := fmt.Sprintf("127.0.0.1:%d", t.port)
 	conn, err := cl.DialTCP(t.ctx, "tcp", target)
 	if err != nil {
+		if !t.failedOnce {
+			log.Printf("[udpgw] UDPGW not available at %s — UDP proxying disabled for this session", target)
+			t.failedOnce = true
+		}
 		return fmt.Errorf("udpgw dial: %w", err)
 	}
 
 	t.conn = conn
 	t.dead = false
+	if t.failedOnce {
+		log.Printf("[udpgw] UDPGW reconnected at %s — UDP proxying resumed", target)
+	}
+	t.failedOnce = false
 	go t.readLoop()
-	log.Printf("[udpgw] connected to %s", target)
 	return nil
 }
 
@@ -159,8 +177,13 @@ func (t *udpgwTunnel) readLoop() {
 }
 
 // Send forwards a UDP datagram to the specified target.
+// Returns nil if UDPGW is unavailable (failed dial, retry window) so
+// the caller can silently drop without log spam.
 func (t *udpgwTunnel) Send(targetIP net.IP, targetPort int, payload []byte) error {
 	if err := t.dial(); err != nil {
+		if t.failedOnce {
+			return nil // silent drop — UDPGW not available
+		}
 		return err
 	}
 
@@ -169,12 +192,15 @@ func (t *udpgwTunnel) Send(targetIP net.IP, targetPort int, payload []byte) erro
 	t.mu.Unlock()
 
 	if conn == nil {
-		return fmt.Errorf("udpgw tunnel dead")
+		return nil // silent drop — tunnel closed
 	}
 
 	frame := packUDPGW(targetIP, targetPort, payload)
 	_, err := conn.Write(frame)
-	return err
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // ResponseChan returns a channel that receives UDP responses for the given key.

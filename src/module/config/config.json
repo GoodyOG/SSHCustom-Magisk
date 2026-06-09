@@ -31,7 +31,7 @@
     "chains_prefix": "SSHC"
   },
   "udp_proxy": {
-    "enabled": false,
+    "enabled": true,
     "udpgw_port": 7300
   },
   "hotspot": {
