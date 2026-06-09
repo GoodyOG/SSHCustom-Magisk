@@ -11,7 +11,6 @@ CONFIG_DIR="$WORK_DIR/config"
 
 ui_print "****************************************"
 ui_print " SSHCustom-Magisk v2.7.0"
-ui_print " Source rebuild + sustained throughput"
 ui_print "****************************************"
 
 ABI="$(getprop ro.product.cpu.abi 2>/dev/null)"
