@@ -1228,7 +1228,9 @@ func run(args []string) {
 		netClean := filepath.Join(*workDir, "net_clean.sh")
 		if _, err := os.Stat(netClean); err == nil {
 			cmd := exec.Command("/system/bin/sh", netClean)
-			_ = cmd.Run()
+			if err := cmd.Run(); err != nil {
+				log.Printf("[stop] net_clean.sh failed: %v", err)
+			}
 		}
 		state.set(func() {
 			state.Running = false

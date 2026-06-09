@@ -136,11 +136,15 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 			listenerCancel = nil
 		}
 		if iptablesUp {
-			_ = cleanupTransparentRules(getCfg())
+			if err := cleanupTransparentRules(getCfg()); err != nil {
+				log.Printf("[tunnel] iptables cleanup failed: %v", err)
+			}
 			iptablesUp = false
 		}
 		if iptablesUDPUp {
-			_ = cleanupTransparentUDPRules(getCfg())
+			if err := cleanupTransparentUDPRules(getCfg()); err != nil {
+				log.Printf("[tunnel] udp iptables cleanup failed: %v", err)
+			}
 			iptablesUDPUp = false
 		}
 		clientPtr.Store(nil)
@@ -676,7 +680,9 @@ func forwardOneDNSQuery(ctx context.Context, listener *net.UDPConn, src *net.UDP
 	if _, err := io.ReadFull(tcp, resp); err != nil {
 		return
 	}
-	_, _ = listener.WriteToUDP(resp, src)
+	if _, err := listener.WriteToUDP(resp, src); err != nil {
+		// Best-effort: resolver will retry in ~5s
+	}
 }
 
 // measureLatency opens a TCP connection to target through the SSH tunnel and

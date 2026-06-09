@@ -2,7 +2,27 @@
 
 All notable changes to SSHCustom-Magisk.
 
-## [2.6.1] — 2026-06-08
+## [2.7.0] — 2026-06-09
+
+### Added
+- **UDP TPROXY support** — Transparent UDP proxying via TPROXY (mangle table) with BadVPN UDPGW client. All UDP traffic (games, VoIP, DNS fallback) tunnels through SSH to your server's UDPGW. Enable via `udp_proxy.enabled` in config.json. Requires BadVPN UDPGW running on server (default port 7300).
+- **Fast dead-connection detection** — Aggressive TCP keepalive on carrier socket: `KEEPIDLE=5s`, `KEEPINTVL=3s`, `KEEPCNT=2` (kernel detection ~11s). SSH keepalive: 2 misses threshold (was 3). Reactive `MarkDead()` triggers immediate reconnect on first transport-level stream failure.
+- **Reactive reconnect** — When a transparent/SOCKS5 stream fails with EOF/timeout/reset, the SSH client is immediately marked dead and reconnection triggers without waiting for keepalive. Stream dials have 8s timeout context to prevent hanging.
+
+### Fixed
+- **KSU/KSU Next "unknown" module** — Root cause: race condition between Go daemon and shell script both writing to `module.prop`. Fixed by making Go daemon the sole writer with atomic temp-file+rename writes, rate-limited to 3s, using ASCII indicators instead of Unicode emoji.
+- **isStreamRetryable case sensitivity** — Now matches Go stdlib lowercase error strings ("connection timed out", "connection refused").
+
+### Changed
+- **module.prop** — Description status: `[ON]` / `[--]` / `[OFF]` (ASCII, no emoji). Atomic write via temp+rename.
+- **TCP keepalive** — `KEEPIDLE 30→5s`, `KEEPINTVL 10→3s`, `KEEPCNT 3→2` on carrier socket.
+- **SSH keepalive** — interval 15→8s, missed threshold 3→2.
+- **Config cleanup** — Removed dead fields: `dns.hijack`, `dns.doh`, `dns.note`, `transport.payload_is_core_feature`, `transparent_proxy.udp_mode`, `transparent_proxy.dns_port`, `transparent_proxy.apply_after_ssh_connected`. Added: `transparent_proxy.udp_port`, `udp_proxy` section, `performance.stream_idle_timeout_seconds`, `performance.read_probe_timeout_seconds`.
+- **Rate-limited log spam** — "connection timed out" errors logged once per 10s with count, instead of hundreds/sec.
+
+### Removed
+- **Dead code** — 7 unused functions, 8 unused Config struct fields, entire DNS mode selection pipeline (normalizeDNSMode, normalizedDNSServers, dnsCfgFromConfig, DNS section of applyConfigPatch — all were dead due to normalizeConfig always overriding to "device").
+- **Shell module.prop writer** — `set_desc()` removed from sshcustom.sh. Daemon is sole writer.
 
 ### Added
 - **Stream retry** — failed direct-tcpip channels auto-retry up to 2x (300ms/600ms backoff) for transient server-side failures (connect timeout, refused, no route). Fixes IDM disconnects during large downloads.

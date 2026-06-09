@@ -63,6 +63,7 @@ package iptables
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -204,8 +205,12 @@ func Apply(cfg Config, bypassIPs []string) error {
 			}
 			run("-t", "nat", "-I", "PREROUTING", "1", "-i", iface, "-p", "tcp", "-j", preChain)
 		}
-		_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-		_ = ipt("-I", "FORWARD", "-j", "ACCEPT").Run()
+		if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "sshcustom: warning: failed to enable ip_forward: %v\n", err)
+		}
+		if err := ipt("-I", "FORWARD", "-j", "ACCEPT").Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "sshcustom: warning: failed to add FORWARD rule: %v\n", err)
+		}
 	}
 
 	// Leak prevention + captive-portal: best-effort, never fail Apply().

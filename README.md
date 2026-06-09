@@ -1,6 +1,6 @@
 # SSHCustom-Magisk
 
-Transparent SSH tunnel proxy for rooted Android. Routes all device TCP traffic through a single SSH connection — no per-app configuration, no VPN slot consumed.
+Transparent SSH tunnel proxy for rooted Android. Routes all device **TCP and UDP** traffic through a single SSH connection — no per-app configuration, no VPN slot consumed. TPROXY-based UDP forwarding via BadVPN UDPGW.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Magisk](https://img.shields.io/badge/Magisk-24.0%2B-00B39B.svg)](https://github.com/topjohnwu/Magisk)
@@ -17,8 +17,9 @@ Transparent SSH tunnel proxy for rooted Android. Routes all device TCP traffic t
 
 ## Features
 
-- **Transparent TCP proxy** — all device TCP traffic routed through SSH via iptables REDIRECT. No per-app setup.
+- **Transparent TCP + UDP proxy** — TCP via iptables REDIRECT, UDP via TPROXY (mangle table) with BadVPN UDPGW client. All traffic through one SSH connection.
 - **DNS-through-tunnel** — device DNS queries proxied as TCP DNS through SSH to prevent leaks.
+- **Fast reconnect** — dead-connection detection in 5-16s (was 45-60s). Aggressive TCP keepalive + reactive MarkDead on first stream failure. Auto-reconnect with exponential backoff.
 - **SOCKS5 proxy** — local proxy at `127.0.0.1:1080` for apps that support proxy configuration.
 - **Hotspot sharing** — share the tunnel over Wi-Fi, USB, or Bluetooth tethering.
 - **Web dashboard** — Material 3 UI at `http://127.0.0.1:9190` with Home, Profiles, Runtime, and Settings tabs. Always available even without an active tunnel.
@@ -32,6 +33,11 @@ Transparent SSH tunnel proxy for rooted Android. Routes all device TCP traffic t
 - **IPv6 disabled** — prevents leaks past the IPv4-only REDIRECT.
 - **Multiple transport modes** — direct SSH, HTTP proxy, TLS/SNI, payload injection.
 - **Dropbear compatible** — vendored x/crypto with Dropbear patches.
+- **KSU / KSU Next compatible** — fixed "unknown" module display. Stable across all root managers.
+
+### UDP Proxy (Optional)
+
+UDP proxying requires [BadVPN UDPGW](https://github.com/ambrop72/badvpn) running on your SSH server (default port 7300). Your server panel (e.g., HTTP Custom setup) likely already includes it. Enable via `udp_proxy.enabled: true` in the WebUI Settings.
 
 ## Installation
 

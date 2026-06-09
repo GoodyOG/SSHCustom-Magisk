@@ -128,7 +128,15 @@ func (t *udpgwTunnel) readLoop() {
 		default:
 		}
 
-		srcIP, srcPort, payload, err := readUDPGWFrame(t.conn)
+		t.mu.Lock()
+		conn := t.conn
+		t.mu.Unlock()
+
+		if conn == nil {
+			return
+		}
+
+		srcIP, srcPort, payload, err := readUDPGWFrame(conn)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("[udpgw] read: %v", err)
