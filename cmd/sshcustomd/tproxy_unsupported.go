@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 )
 
@@ -14,6 +15,10 @@ func listenTransparentTCP(ctx context.Context, addr string) (net.Listener, error
 
 func listenTransparentUDP(ctx context.Context, addr string) (*udpTproxyConn, error) {
 	return nil, errors.New("TPROXY UDP only supported on linux")
+}
+
+func tproxyDst(conn *net.TCPConn) (string, error) {
+	return "", fmt.Errorf("TPROXY only supported on linux")
 }
 
 func setTransparent(fd int) error {

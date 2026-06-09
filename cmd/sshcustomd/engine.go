@@ -535,7 +535,7 @@ func handleSOCKSClient(ctx context.Context, c net.Conn, cfg Config, curClient fu
 
 func serveTransparent(ctx context.Context, cfg Config, curClient func() *tunClient, st *State) {
 	addr := transparentAddr(cfg)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenTransparentTCP(ctx, addr)
 	if err != nil {
 		log.Printf("[transparent] listen %s: %v", addr, err)
 		st.set(func() { st.TransparentRunning = false; st.LastError = "transparent listen failed: " + err.Error() })
@@ -547,8 +547,14 @@ func serveTransparent(ctx context.Context, cfg Config, curClient func() *tunClie
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			st.set(func() { st.TransparentRunning = false })
-			return
+			// Transient accept errors (e.g. ECONNABORTED) on TPROXY sockets
+			// are normal under load. Log and continue; only exit on context cancel.
+			if ctx.Err() != nil {
+				st.set(func() { st.TransparentRunning = false })
+				return
+			}
+			log.Printf("[transparent] accept error: %v — continuing", err)
+			continue
 		}
 		go handleTransparentClient(ctx, c, cfg, curClient)
 	}
@@ -558,18 +564,26 @@ func handleTransparentClient(ctx context.Context, c net.Conn, cfg Config, curCli
 	defer c.Close()
 	tcp, ok := c.(*net.TCPConn)
 	if !ok {
+		log.Printf("[transparent] dropped: not a TCP connection (%T)", c)
 		return
 	}
-	target, err := originalDst(tcp)
+	target, err := tproxyDst(tcp)
 	if err != nil {
+		log.Printf("[transparent] dropped: tproxy dst failed: %v", err)
 		return
 	}
 	if isLocalOrBlockedTarget(target, cfg) {
+		log.Printf("[transparent] dropped: local/blocked target %s", target)
 		return
 	}
 	tuneTCPConn(c, cfg, false)
 	cl := curClient()
 	if cl == nil || cl.IsDead() {
+		if cl == nil {
+			log.Printf("[transparent] dropped %s: no SSH client (reconnecting)", target)
+		} else {
+			log.Printf("[transparent] dropped %s: SSH client dead", target)
+		}
 		return // reconnecting or dead — drop (fail-closed)
 	}
 	dialCtx, dialCancel := context.WithTimeout(ctx, 8*time.Second)

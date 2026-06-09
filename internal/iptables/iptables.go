@@ -1,6 +1,6 @@
 // Package iptables installs and removes the SSHCustom transparent-proxy
-// chains using REDIRECT (nat table) and the leak-prevention side-effects that
-// make a TCP-only SSH tunnel behave correctly on modern Android ROMs
+// chains using TPROXY (mangle table) and the leak-prevention side-effects that
+// make a TCP/UDP SSH tunnel behave correctly on modern Android ROMs
 // (HyperOS 3 / MIUI / OneUI / ColorOS).
 //
 // # Design notes
@@ -11,47 +11,45 @@
 // installed. vpnchain's ssh.iptables uses "iptables -w 100" on every call for
 // the same reason — this is the single most important correctness requirement.
 //
-// We install two chains in the nat table:
+// # v2.7+ TPROXY architecture (mangle table)
 //
-//   - SSHC_OUTPUT  hooked into nat OUTPUT,  for traffic from this device.
-//   - SSHC_PREROUTING  hooked into nat PREROUTING per hotspot interface,
-//     for traffic from tethered clients.
+// TCP and UDP are both intercepted in the mangle table via TPROXY. The
+// kernel preserves the original destination address; the daemon reads it
+// from the socket's local address (TCP) or IP_RECVORIGDSTADDR (UDP).
 //
-// Each chain RETURNs traffic destined to private/loopback/link-local CIDRs,
-// the daemon's own bypass IPs (resolved SSH endpoint addresses), and the
-// daemon's own listener ports. Anything else hits a final
-// REDIRECT --to-ports <transparent_tcp_port>, which the kernel rewrites
-// in-place; the daemon then reads the original destination via the
-// SO_ORIGINAL_DST socket option.
+// Two mangle chains are installed for TCP:
+//
+//   - SSHC_TCP  hooked into mangle PREROUTING. Catches both device-originated
+//     (after OUTPUT MARK re-routing) and hotspot-forwarded TCP traffic.
+//     Terminal rule: TPROXY --on-port <port> --tproxy-mark 0x1/0x1.
+//
+//   - SSHC_TCP_OUTPUT  hooked into mangle OUTPUT. Marks locally-generated TCP
+//     traffic with 0x1/0x1 so it re-enters via PREROUTING (TPROXY cannot
+//     be used in OUTPUT). Terminal rule: MARK --set-mark 0x1/0x1.
+//
+// UDP has a separate SSHC_UDP chain in mangle PREROUTING (installed by
+// ApplyUDP). Both share the same policy routing (fwmark 1 → table 100).
 //
 // # DNS-through-tunnel (the real no-internet fix)
 //
 // We redirect device UDP:53 to our local DNS forwarder (127.0.0.1:5353),
 // which proxies each query as TCP DNS through the SSH tunnel to 8.8.8.8.
-// This is what makes Android's captive-portal NetworkMonitor probe succeed:
-// the probe resolves its target, reaches it through the tunnel, gets a 204,
-// and marks the network validated. captive_portal_mode=0 alone is NOT enough
-// on HyperOS 3 / Android 16 — the OS still fires the probe. The DNS tunnel +
-// captive_portal_server=localhost together make the probe hit our forwarder
-// (which goes through the tunnel to a real 204 endpoint), clearing the tag
-// without any disruptive data toggle. This is exactly vpnchain's approach.
+// This is what makes Android's captive-portal NetworkMonitor probe succeed.
 //
-// # Leak prevention (always applied with the redirect rules)
+// # Leak prevention (always applied with the TPROXY rules)
 //
 //   - QUIC (UDP/443 and UDP/80): DROPped so browsers fall back to TCP.
-//     DROP not REJECT — vpnchain's own code documents that ipt_REJECT is
-//     not reliably available on Android kernels.
-//   - IPv6: disabled system-wide (REDIRECT is IPv4-only).
+//   - IPv6: disabled system-wide (TPROXY is IPv4-only).
 //
 // # Bypass IPs
 //
 // The daemon passes in the resolved SSH endpoint IPs at apply time.
 // Each becomes a -d <ip> RETURN rule so the SSH carrier connection itself
-// is never caught by the REDIRECT and looped back.
+// is never caught by the TPROXY and looped back.
 //
 // # uid-0 RETURN rule
 //
-// SSHC_OUTPUT skips uid 0 so the daemon's own connections (SSH tunnel,
+// SSHC_TCP_OUTPUT skips uid 0 so the daemon's own connections (SSH tunnel,
 // DNS lookups) are not redirected through themselves.
 //
 // # Cleanup is idempotent
@@ -103,7 +101,8 @@ var privateCIDRs = []string{
 }
 
 // allLegacyChains lists every chain name ever created across all SSHCustom
-// versions so Cleanup() removes orphans from older installs too.
+// versions so Cleanup() removes orphans from older installs too. Includes
+// legacy nat chains (pre-v2.7) and current mangle chains.
 func allLegacyChains(prefix string) []string {
 	return []string{
 		prefix + "_OUTPUT",
@@ -112,6 +111,8 @@ func allLegacyChains(prefix string) []string {
 		prefix + "_DNS",
 		prefix + "_HOTSPOT",
 		prefix + "_HOTSPOT_DNS",
+		prefix + "_TCP",
+		prefix + "_TCP_OUTPUT",
 	}
 }
 
@@ -127,9 +128,12 @@ func ip6t(args ...string) *exec.Cmd {
 	return exec.Command("ip6tables", append([]string{"-w", "100"}, args...)...)
 }
 
-// Apply installs the REDIRECT chains, DNS-through-tunnel, QUIC block, IPv6
-// disable, TCP tuning, and captive-portal bypass. bypassIPs are the resolved
-// SSH endpoint IPs that must not be caught by the REDIRECT rule.
+// Apply installs TPROXY chains in the mangle table for TCP, DNS-through-tunnel,
+// QUIC block, IPv6 disable, TCP tuning, and captive-portal bypass. Bypass IPs
+// are the resolved SSH endpoint IPs that must not be caught by TPROXY.
+//
+// v2.7+ uses mangle/TPROXY for TCP (was nat/REDIRECT). UDP TPROXY is handled
+// separately by ApplyUDP() — both share the same policy routing (fwmark 1).
 func Apply(cfg Config, bypassIPs []string) error {
 	prefix := cfg.ChainsPrefix
 	if prefix == "" {
@@ -139,8 +143,8 @@ func Apply(cfg Config, bypassIPs []string) error {
 	if port <= 0 {
 		port = 10810
 	}
-	outChain := prefix + "_OUTPUT"
-	preChain := prefix + "_PREROUTING"
+	tcpChain := prefix + "_TCP"
+	tcpOutChain := prefix + "_TCP_OUTPUT"
 
 	var errs []string
 	run := func(args ...string) {
@@ -151,49 +155,44 @@ func Apply(cfg Config, bypassIPs []string) error {
 	}
 
 	// Pre-pass: tear down any existing rules from a prior run or a crash.
-	// This must not touch IPv6/captive-portal state so we don't flap them.
+	// Removes both old nat chains (pre-v2.7) and current mangle chains.
 	cleanupRules(cfg)
 
-	for _, ch := range []string{outChain, preChain} {
-		run("-t", "nat", "-N", ch)
-		run("-t", "nat", "-F", ch)
+	// ----- Policy routing (shared with UDP TPROXY) -----
+	setupPolicyRouting()
+
+	for _, ch := range []string{tcpChain, tcpOutChain} {
+		run("-t", "mangle", "-N", ch)
+		run("-t", "mangle", "-F", ch)
 	}
 
-	addBypasses := func(ch string, isOutput bool) {
-		// uid owner match only works on OUTPUT (not on PREROUTING where no uid
-		// is yet assigned to the packet).
-		if isOutput {
-			run("-t", "nat", "-A", ch, "-m", "owner", "--uid-owner", "0", "-j", "RETURN")
-		}
-		for _, cidr := range privateCIDRs {
-			run("-t", "nat", "-A", ch, "-d", cidr, "-j", "RETURN")
-		}
-		for _, ip := range bypassIPs {
-			ip = strings.TrimSpace(ip)
-			if ip == "" {
-				continue
-			}
-			run("-t", "nat", "-A", ch, "-d", ip, "-j", "RETURN")
-		}
-		// Exempt the daemon's own listener ports so it can accept connections.
-		// Port 5353 is the DNS-through-tunnel forwarder — exempt it so the
-		// forwarder's own TCP upstream connections are never REDIRECT-looped.
-		// NOTE: Port 80 removed - it was blocking all HTTP traffic to Google/etc.
-		// The localhost captive server doesn't need exemption since probes use
-		// uid 0 which already has a RETURN rule.
-		for _, p := range []int{cfg.APIPort, cfg.SocksPort, cfg.TCPPort, cfg.DNSForwardPort} {
-			if p > 0 {
-				run("-t", "nat", "-A", ch, "-p", "tcp", "--dport", strconv.Itoa(p), "-j", "RETURN")
-			}
-		}
-		run("-t", "nat", "-A", ch, "-p", "tcp", "-j", "REDIRECT", "--to-ports", strconv.Itoa(port))
+	// ----- SSHC_TCP (mangle PREROUTING) — catches all incoming TCP -----
+	// Bypass: private/loopback/multicast CIDRs
+	for _, cidr := range privateCIDRs {
+		run("-t", "mangle", "-A", tcpChain, "-d", cidr, "-j", "RETURN")
 	}
-	addBypasses(outChain, true)
-	addBypasses(preChain, false)
+	// Bypass: SSH endpoint IPs (our carrier connection)
+	for _, ip := range bypassIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		run("-t", "mangle", "-A", tcpChain, "-d", ip, "-j", "RETURN")
+	}
+	// Bypass: daemon's own listener ports
+	for _, p := range []int{cfg.APIPort, cfg.SocksPort, cfg.TCPPort, cfg.DNSForwardPort} {
+		if p > 0 {
+			run("-t", "mangle", "-A", tcpChain, "-p", "tcp", "--dport", strconv.Itoa(p), "-j", "RETURN")
+		}
+	}
+	// Terminal: TPROXY to our TCP listener
+	run("-t", "mangle", "-A", tcpChain, "-p", "tcp", "-j", "TPROXY",
+		"--on-port", strconv.Itoa(port), "--tproxy-mark", "0x1/0x1")
 
-	// Hook at position 1 so we run before any other module's rules.
-	run("-t", "nat", "-I", "OUTPUT", "1", "-p", "tcp", "-j", outChain)
+	// Hook into mangle PREROUTING at position 1
+	run("-t", "mangle", "-I", "PREROUTING", "1", "-p", "tcp", "-j", tcpChain)
 
+	// Hotspot: per-interface hooks into PREROUTING for tethered clients
 	if cfg.Hotspot {
 		ifaces := cfg.HotspotIfaces
 		if len(ifaces) == 0 {
@@ -203,7 +202,7 @@ func Apply(cfg Config, bypassIPs []string) error {
 			if strings.TrimSpace(iface) == "" {
 				continue
 			}
-			run("-t", "nat", "-I", "PREROUTING", "1", "-i", iface, "-p", "tcp", "-j", preChain)
+			run("-t", "mangle", "-I", "PREROUTING", "1", "-i", iface, "-p", "tcp", "-j", tcpChain)
 		}
 		if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "sshcustom: warning: failed to enable ip_forward: %v\n", err)
@@ -213,9 +212,37 @@ func Apply(cfg Config, bypassIPs []string) error {
 		}
 	}
 
-	// Leak prevention + captive-portal: best-effort, never fail Apply().
-	// Order matters: DNS forward first (probe needs it), then QUIC block
-	// (forces TCP), then IPv6 off, then TCP buffer tuning, then captive portal.
+	// ----- SSHC_TCP_OUTPUT (mangle OUTPUT) — marks device TCP for re-routing -----
+	// TPROXY cannot be used in OUTPUT; we MARK outgoing TCP packets with 0x1/0x1
+	// so they get re-routed via the policy routing table (table 100) through lo,
+	// then re-enter PREROUTING where SSHC_TCP catches them.
+	// Bypass: uid 0 (daemon's own traffic)
+	run("-t", "mangle", "-A", tcpOutChain, "-m", "owner", "--uid-owner", "0", "-j", "RETURN")
+	// Bypass: private/loopback CIDRs
+	for _, cidr := range privateCIDRs {
+		run("-t", "mangle", "-A", tcpOutChain, "-d", cidr, "-j", "RETURN")
+	}
+	// Bypass: SSH endpoint IPs
+	for _, ip := range bypassIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		run("-t", "mangle", "-A", tcpOutChain, "-d", ip, "-j", "RETURN")
+	}
+	// Bypass: daemon listener ports
+	for _, p := range []int{cfg.APIPort, cfg.SocksPort, cfg.TCPPort, cfg.DNSForwardPort} {
+		if p > 0 {
+			run("-t", "mangle", "-A", tcpOutChain, "-p", "tcp", "--dport", strconv.Itoa(p), "-j", "RETURN")
+		}
+	}
+	// Terminal: MARK for re-routing through PREROUTING
+	run("-t", "mangle", "-A", tcpOutChain, "-p", "tcp", "-j", "MARK", "--set-mark", "0x1/0x1")
+
+	// Hook into mangle OUTPUT at position 1
+	run("-t", "mangle", "-I", "OUTPUT", "1", "-p", "tcp", "-j", tcpOutChain)
+
+	// ----- Leak prevention + captive-portal (best-effort) -----
 	setupDNSForward(prefix, cfg.DNSForwardPort)
 	blockQUIC()
 	disableIPv6()
@@ -229,8 +256,6 @@ func Apply(cfg Config, bypassIPs []string) error {
 			strings.Contains(e, "Chain already exists") {
 			continue
 		}
-		// Log every non-fatal warning so on-device debugging doesn't require
-		// reading raw iptables output. Errors here do NOT fail Apply().
 		fmt.Printf("[iptables] warn: %s\n", e)
 		fatal = append(fatal, e)
 	}
@@ -240,35 +265,38 @@ func Apply(cfg Config, bypassIPs []string) error {
 	return nil
 }
 
-// Cleanup removes all SSHC chains, re-enables IPv6, and restores captive-portal.
+// Cleanup removes all SSHC chains (nat, mangle, filter), re-enables IPv6,
+// and restores captive-portal.
 func Cleanup(cfg Config) error {
 	cleanupRules(cfg)
+	// Clean UDP TPROXY mangle chain too
+	_ = cleanupUDPChain(cfg)
 	enableIPv6()
 	restoreCaptivePortal()
 	return nil
 }
 
-// cleanupRules tears down only the iptables state. Does NOT touch IPv6 sysctls
-// or captive-portal settings — Apply() calls this as a pre-pass and must not
-// flap those device-wide toggles.
+// cleanupRules tears down all SSHC iptables rules in both nat (legacy pre-v2.7)
+// and mangle (v2.7+ TPROXY) tables. Does NOT touch IPv6 sysctls or captive-portal
+// settings — Apply() calls this as a pre-pass and must not flap those.
 func cleanupRules(cfg Config) {
 	prefix := cfg.ChainsPrefix
 	if prefix == "" {
 		prefix = DefaultPrefix
 	}
 	chains := allLegacyChains(prefix)
-	ifaces := cfg.HotspotIfaces
-	if len(ifaces) == 0 {
-		ifaces = DefaultHotspotIfaces
-	}
 
-	// Phase 1: detach all hook shapes we have ever used (handles rolling upgrades).
+	// Phase 0: Clean old nat table hooks (pre-v2.7 REDIRECT chains)
 	for _, ch := range chains {
 		_ = ipt("-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", ch).Run()
 		_ = ipt("-t", "nat", "-D", "OUTPUT", "-j", ch).Run()
 		_ = ipt("-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", ch).Run()
 		_ = ipt("-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", ch).Run()
 		_ = ipt("-t", "nat", "-D", "PREROUTING", "-j", ch).Run()
+		ifaces := cfg.HotspotIfaces
+		if len(ifaces) == 0 {
+			ifaces = DefaultHotspotIfaces
+		}
 		for _, iface := range ifaces {
 			if strings.TrimSpace(iface) == "" {
 				continue
@@ -277,14 +305,39 @@ func cleanupRules(cfg Config) {
 			_ = ipt("-t", "nat", "-D", "PREROUTING", "-i", iface, "-j", ch).Run()
 		}
 	}
-	// Phase 2: flush then delete (must follow phase 1 — can't delete a
-	// chain that is still referenced by a hook).
+
+	// Phase 1: Detach mangle table hooks (v2.7+ TPROXY chains)
+	_ = ipt("-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-j", prefix+"_TCP").Run()
+	_ = ipt("-t", "mangle", "-D", "OUTPUT", "-p", "tcp", "-j", prefix+"_TCP_OUTPUT").Run()
+
+	// Phase 2: Flush and delete ALL chains in ALL tables
 	for _, ch := range chains {
+		// nat table (legacy)
 		_ = ipt("-t", "nat", "-F", ch).Run()
 		_ = ipt("-t", "nat", "-X", ch).Run()
+		// mangle table (v2.7+)
+		_ = ipt("-t", "mangle", "-F", ch).Run()
+		_ = ipt("-t", "mangle", "-X", ch).Run()
 	}
+
 	_ = ipt("-D", "FORWARD", "-j", "ACCEPT").Run()
 	unblockQUIC()
+}
+
+// setupPolicyRouting creates the fwmark-based routing table used by both TCP
+// and UDP TPROXY. Idempotent — errors from existing rules are suppressed.
+// Without the local route, TPROXY-marked packets destined for non-loopback
+// addresses are silently dropped by the kernel.
+func setupPolicyRouting() {
+	exec.Command("/system/bin/sh", "-c",
+		"ip rule add fwmark 0x1/0x1 table 100 pref 100 2>/dev/null; "+
+			"ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
+
+	// route_localnet=1 is REQUIRED for OUTPUT-marked packets that get
+	// re-routed through lo. Without it, the kernel drops packets with
+	// non-loopback destinations arriving on the loopback interface.
+	shRun(`sysctl -w net.ipv4.conf.lo.route_localnet=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/conf/lo/route_localnet`)
+	shRun(`sysctl -w net.ipv4.conf.all.route_localnet=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet`)
 }
 
 // setupDNSForward redirects device UDP:53 to 127.0.0.1:<port> (our DNS
@@ -505,34 +558,35 @@ sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864" 2>/dev/null || echo "4096 6553
 }
 
 // ApplyUDP installs UDP TPROXY rules in the mangle table for capturing
-// UDP traffic via TPROXY into the daemon's local listener.
+// UDP traffic via TPROXY into the daemon's local listener. Shares the same
+// policy routing (fwmark 1, table 100) with TCP TPROXY.
 func ApplyUDP(cfg Config) error {
 	port := cfg.UDPPort
 	if port <= 0 {
 		port = 10811
 	}
 
-	// 1. Add policy routing rule: fwmark 1 -> table 100
-	exec.Command("/system/bin/sh", "-c", "ip rule add fwmark 0x1/0x1 table 100 2>/dev/null; ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
+	// Policy routing is shared with TCP — idempotent call
+	setupPolicyRouting()
 
-	// 2. mangle PREROUTING: TPROXY UDP to our listener
 	ipt("-t", "mangle", "-N", "SSHC_UDP", "2>/dev/null").Run()
-	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", "53", "-j", "RETURN").Run() // skip DNS (forwarded separately)
-	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", strconv.Itoa(port), "-j", "RETURN").Run() // skip self
+	ipt("-t", "mangle", "-F", "SSHC_UDP", "2>/dev/null").Run()
+	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", "53", "-j", "RETURN").Run()
+	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "--dport", strconv.Itoa(port), "-j", "RETURN").Run()
 	ipt("-t", "mangle", "-A", "SSHC_UDP", "-p", "udp", "-j", "TPROXY", "--on-port", strconv.Itoa(port), "--tproxy-mark", "0x1/0x1").Run()
 	ipt("-t", "mangle", "-I", "PREROUTING", "1", "-j", "SSHC_UDP").Run()
 	return nil
 }
 
-// CleanupUDP removes the UDP TPROXY rules installed by ApplyUDP.
+// CleanupUDP removes the UDP TPROXY mangle chain. Does NOT remove shared
+// policy routing (that is handled by Cleanup).
 func CleanupUDP(cfg Config) error {
-	port := cfg.UDPPort
-	if port <= 0 {
-		port = 10811
-	}
+	return cleanupUDPChain(cfg)
+}
+
+func cleanupUDPChain(cfg Config) error {
 	ipt("-t", "mangle", "-D", "PREROUTING", "-j", "SSHC_UDP", "2>/dev/null").Run()
 	ipt("-t", "mangle", "-F", "SSHC_UDP", "2>/dev/null").Run()
 	ipt("-t", "mangle", "-X", "SSHC_UDP", "2>/dev/null").Run()
-	exec.Command("/system/bin/sh", "-c", "ip rule del fwmark 0x1/0x1 table 100 2>/dev/null; ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null").Run()
 	return nil
 }

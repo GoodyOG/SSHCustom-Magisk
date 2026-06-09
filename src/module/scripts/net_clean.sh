@@ -103,7 +103,20 @@ clean_udp_tproxy() {
   run $IPT -t mangle -D PREROUTING -j SSHC_UDP
   run $IPT -t mangle -F SSHC_UDP
   run $IPT -t mangle -X SSHC_UDP
-  # Clean policy routing rules
+}
+
+clean_tcp_tproxy() {
+  # Clean up mangle table TPROXY rules for TCP proxy
+  run $IPT -t mangle -D PREROUTING -p tcp -j SSHC_TCP
+  run $IPT -t mangle -D OUTPUT -p tcp -j SSHC_TCP_OUTPUT
+  run $IPT -t mangle -F SSHC_TCP
+  run $IPT -t mangle -X SSHC_TCP
+  run $IPT -t mangle -F SSHC_TCP_OUTPUT
+  run $IPT -t mangle -X SSHC_TCP_OUTPUT
+}
+
+clean_tproxy_routing() {
+  # Clean policy routing rules (shared between TCP and UDP TPROXY)
   run ip rule del fwmark 0x1/0x1 table 100
   run ip route del local 0.0.0.0/0 dev lo table 100
 }
@@ -113,6 +126,8 @@ clean_v4
 clean_v6
 clean_quic
 clean_udp_tproxy
+clean_tcp_tproxy
+clean_tproxy_routing
 restore_ipv6
 restore_captive_portal
 log "clean complete"
