@@ -396,16 +396,14 @@ func selectedProfile(pf ProfilesFile) *Profile {
 }
 
 func main() {
-	// Keep RSS lower on Android during many transparent TCP streams.
-	// Higher GC threshold = fewer pauses during sustained download bursts.
-	debug.SetGCPercent(200)
-	// Soft memory limit: let the runtime use up to 192MB RSS before it starts
-	// aggressively reclaiming. Prevents OOM kills on 2–3GB Android devices
-	// while still leaving headroom. Set via GOMEMLIMIT env to override.
+	// Balanced GC for Android: GCPercent=100 triggers collection when heap
+	// doubles (vs 200 = triples). Smaller pauses, steadier throughput.
+	// Memory limit 96MB keeps RSS low on 2-3GB devices — the daemon rarely
+	// exceeds 40MB under load, so 96MB gives 2x headroom for bursts.
+	debug.SetGCPercent(100)
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(192 * 1024 * 1024)
+		debug.SetMemoryLimit(96 * 1024 * 1024)
 	}
-	// Use all CPUs — download workloads benefit from parallel I/O goroutines.
 	maxProcs := runtime.NumCPU()
 	if maxProcs > 8 {
 		maxProcs = 8
@@ -2570,18 +2568,37 @@ func normalizedDNSServers(in []string) []string {
 	return out
 }
 
+var cachedRoute struct {
+	sync.Mutex
+	ri      RouteInfo
+	expires time.Time
+}
+
 func routeInfo() RouteInfo {
-	// Pure-Go route detection: UDP connect triggers kernel route lookup
-	// without actually sending any packets. Zero subprocess overhead.
-	// Falls back gracefully if the kernel rejects the connect.
+	// 5-second cache: route changes are rare (tower handoff, WiFi switch)
+	// and this function is called every 2s in the health ticker plus on
+	// every reconnect attempt. Avoiding repeated UDP dial + net.Interfaces
+	// enumeration saves syscall overhead on Android.
+	cachedRoute.Lock()
+	if time.Now().Before(cachedRoute.expires) {
+		ri := cachedRoute.ri
+		cachedRoute.Unlock()
+		return ri
+	}
+	cachedRoute.Unlock()
+
 	conn, err := net.DialTimeout("udp", "1.1.1.1:53", 1*time.Second)
 	if err != nil {
-		return RouteInfo{Online: false, Raw: ""}
+		ri := RouteInfo{Online: false, Raw: ""}
+		cachedRoute.Lock()
+		cachedRoute.ri = ri
+		cachedRoute.expires = time.Now().Add(5 * time.Second)
+		cachedRoute.Unlock()
+		return ri
 	}
 	defer conn.Close()
 	laddr := conn.LocalAddr().String()
 	src, _, _ := net.SplitHostPort(laddr)
-	// Get interface name from local address
 	iface := ""
 	if src != "" {
 		ifaceList, ierr := net.Interfaces()
@@ -2600,7 +2617,12 @@ func routeInfo() RouteInfo {
 			}
 		}
 	}
-	return RouteInfo{Online: true, Raw: laddr, Src: src, Iface: iface}
+	ri := RouteInfo{Online: true, Raw: laddr, Src: src, Iface: iface}
+	cachedRoute.Lock()
+	cachedRoute.ri = ri
+	cachedRoute.expires = time.Now().Add(5 * time.Second)
+	cachedRoute.Unlock()
+	return ri
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

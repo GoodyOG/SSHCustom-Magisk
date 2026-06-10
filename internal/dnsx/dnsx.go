@@ -177,6 +177,19 @@ func cache(key string, ips []string, method string) {
 	if hostCache.entries == nil {
 		hostCache.entries = make(map[string]cacheEntry)
 	}
+	// Evict oldest entries if cache exceeds 2000 to prevent unbounded
+	// growth on long-running sessions (days/weeks of device uptime).
+	if len(hostCache.entries) >= 2000 {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, e := range hostCache.entries {
+			if oldestKey == "" || e.expires.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = e.expires
+			}
+		}
+		delete(hostCache.entries, oldestKey)
+	}
 	hostCache.entries[key] = cacheEntry{
 		ips:     ips,
 		method:  method,

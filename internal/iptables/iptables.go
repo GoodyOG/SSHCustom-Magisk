@@ -492,8 +492,13 @@ func resetRevalidation() {
 // itself, see the speed_boost call in sshcustom.sh which runs BEFORE the daemon
 // starts. The larger ceilings are harmless (the kernel auto-tunes within them).
 func tuneTCP() {
-	shRun(`sysctl -w net.core.rmem_max=67108864 2>/dev/null || echo 67108864 > /proc/sys/net/core/rmem_max
-sysctl -w net.core.wmem_max=67108864 2>/dev/null || echo 67108864 > /proc/sys/net/core/wmem_max
-sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864" 2>/dev/null || echo "4096 87380 67108864" > /proc/sys/net/ipv4/tcp_rmem
-sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864" 2>/dev/null || echo "4096 65536 67108864" > /proc/sys/net/ipv4/tcp_wmem`)
+	// 4MB ceiling: enough for ~200Mbps at 150ms RTT (BDP ≈ 3.75MB).
+	// The old 64MB ceiling caused kernel bufferbloat on Android — as more
+	// sockets opened over time, the kernel allocated massive buffers, RAM
+	// pressure grew, and throughput collapsed. 4MB keeps the single carrier
+	// socket saturated without letting every socket hoard kernel memory.
+	shRun(`sysctl -w net.core.rmem_max=4194304 2>/dev/null || echo 4194304 > /proc/sys/net/core/rmem_max
+sysctl -w net.core.wmem_max=4194304 2>/dev/null || echo 4194304 > /proc/sys/net/core/wmem_max
+sysctl -w net.ipv4.tcp_rmem="4096 87380 4194304" 2>/dev/null || echo "4096 87380 4194304" > /proc/sys/net/ipv4/tcp_rmem
+sysctl -w net.ipv4.tcp_wmem="4096 65536 4194304" 2>/dev/null || echo "4096 65536 4194304" > /proc/sys/net/ipv4/tcp_wmem`)
 }

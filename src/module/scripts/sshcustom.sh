@@ -97,10 +97,10 @@ start_daemon() {
   # Without this the carrier socket is created with Android's tiny defaults
   # (~256 KB) and throughput on high-latency 5G links is severely capped.
   log "applying TCP speed_boost before daemon start"
-  sysctl -w net.core.rmem_max=67108864    >/dev/null 2>&1 || true
-  sysctl -w net.core.wmem_max=67108864    >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864" >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864" >/dev/null 2>&1 || true
+  sysctl -w net.core.rmem_max=4194304    >/dev/null 2>&1 || true
+  sysctl -w net.core.wmem_max=4194304    >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_rmem="4096 87380 4194304" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_wmem="4096 65536 4194304" >/dev/null 2>&1 || true
 
   EXTRA_FLAGS=""
   if [ "$1" = "--idle" ]; then
