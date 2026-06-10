@@ -20,15 +20,6 @@ DNS → iptables DNAT → DNS forwarder → SSH TCP DNS → 8.8.8.8
 - **DNS**: UDP port 53 is redirected to a local forwarder that proxies queries as TCP DNS through the SSH tunnel to 8.8.8.8. This fixes "no internet" warnings on restrictive networks.
 - **QUIC** (UDP 443/80): Blocked to force Chrome/YouTube to fall back to TCP, which is then tunneled.
 
-## Screenshots
-
-<p align="center">
-  <img src="docs/screenshot_home.png" width="200" alt="Home"/>
-  <img src="docs/screenshot_profiles.png" width="200" alt="Profiles"/>
-  <img src="docs/screenshot_runtime.png" width="200" alt="Runtime"/>
-  <img src="docs/screenshot_settings.png" width="200" alt="Settings"/>
-</p>
-
 ## Features
 
 - **Transparent TCP proxy** — all device TCP traffic routed through SSH via iptables REDIRECT. No per-app setup.
