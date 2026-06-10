@@ -246,6 +246,7 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 		// Wait for this client to die, refreshing live stats meanwhile.
 		healthTicker := time.NewTicker(2 * time.Second)
 		waitDone := make(chan error, 1)
+		var waitErr error
 		go func() { waitDone <- tc.Wait() }()
 	wait:
 		for {
@@ -255,7 +256,7 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 				tc.Close()
 				clientPtr.Store(nil)
 				return
-			case <-waitDone:
+			case waitErr = <-waitDone:
 				break wait
 			case <-healthTicker.C:
 				ri := routeInfo()
@@ -267,6 +268,20 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 				}
 				if streams >= maxStreams*4/5 {
 					log.Printf("[tunnel] high stream usage: %d/%d (%.0f%%)", streams, maxStreams, float64(streams)/float64(maxStreams)*100)
+				}
+				// Circuit breaker: if transport errors are cascading across
+				// streams, the SSH session is corrupted (Dropbear oversized
+				// packets, network corruption, etc.). Force-close the client
+				// so tunnelLoop reconnects with a fresh SSH session instead
+				// of letting every stream fail individually.
+				te := transportErrorCount.Swap(0)
+				if te >= 5 {
+					log.Printf("[tunnel] %d transport errors detected; forcing SSH reconnect for clean session", te)
+					tc.Close()
+					clientPtr.Store(nil)
+					healthTicker.Stop()
+					waitErr = fmt.Errorf("forced reconnect after %d transport errors", te)
+					break wait
 				}
 				st.set(func() {
 					st.PoolStreams = streams
@@ -281,7 +296,7 @@ func tunnelLoop(ctx context.Context, getCfg func() Config, sp Profile, st *State
 		}
 		healthTicker.Stop()
 
-		waitErr := <-waitDone
+		// waitErr already set in select loop above
 		reason := classifyDisconnect(waitErr)
 		tc.Close()
 		clientPtr.Store(nil)

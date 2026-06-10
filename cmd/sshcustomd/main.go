@@ -1328,33 +1328,22 @@ func shortBannerLog(message string) string {
 	return m
 }
 
-// packetErrCount throttles "packet too large" log spam.
-// These errors happen many times/second under load and fill the log.
-var packetErrCount struct {
-	sync.Mutex
-	count int
-	last  time.Time
-}
+// transportErrorCount tracks stream failures caused by SSH transport errors.
+// When too many accumulate in a short window, the tunnel health check in
+// tunnelLoop force-disconnects the SSH client to trigger a fresh reconnect.
+var transportErrorCount atomic.Int64
 
 func logTunnelOpenError(prefix, target string, err error) {
 	if err == nil {
 		return
 	}
 	s := strings.ToLower(err.Error())
-	if strings.Contains(s, "bad record mac") || strings.Contains(s, "error decoding message") || strings.Contains(s, "use of closed network connection") || strings.Contains(s, "eof") {
-		log.Printf("%s failed target=%s: transport reset; reconnecting SSH session", prefix, target)
-		return
-	}
-	// Suppress packet-too-large spam — log once per 10s with count
-	if strings.Contains(s, "packet too large") || strings.Contains(s, "invalid packet length") {
-		packetErrCount.Lock()
-		packetErrCount.count++
-		if time.Since(packetErrCount.last) > 10*time.Second {
-			log.Printf("%s packet size error (x%d in last 10s): Dropbear sent oversized packet; will fix on next pool connect", prefix, packetErrCount.count)
-			packetErrCount.count = 0
-			packetErrCount.last = time.Now()
-		}
-		packetErrCount.Unlock()
+	// Transport-level errors mean the SSH session itself is dying or corrupted.
+	// Count them so the tunnel health check can force a reconnect when they
+	// cascade (Dropbear oversized packets, network hiccup, etc.).
+	if strings.Contains(s, "bad record mac") || strings.Contains(s, "error decoding message") || strings.Contains(s, "use of closed network connection") || strings.Contains(s, "eof") || strings.Contains(s, "packet too large") || strings.Contains(s, "invalid packet length") {
+		transportErrorCount.Add(1)
+		log.Printf("%s failed target=%s: %v", prefix, target, err)
 		return
 	}
 	log.Printf("%s failed target=%s: %v", prefix, target, err)
